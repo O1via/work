@@ -38,7 +38,7 @@ def _base_disturbance_half_bounds(dynamics: str) -> np.ndarray:
         return np.array([0.01, 0.01, 0.005, 0.005], dtype=float)
     if dynamics == "iris_linear":
         # x=[pn,pe,vn,ve,pd,vd,phi,theta]
-        return np.array([0.003 * 1.146397572585021, 0.003, 0.006, 0.006, 0.008, 0.012, 0.002, 0.002], dtype=float)
+        return np.array([0.003, 0.003, 0.006, 0.006, 0.008, 0.012, 0.002, 0.002], dtype=float)
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 
 

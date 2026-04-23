@@ -872,7 +872,7 @@ if __name__ == "__main__":
         help="How GP uncertainty bound is merged with disturbance bound for tube sizing.",
     )
     parser.add_argument("--tracking-shape", choices=["line", "circle"], default="circle")
-    parser.add_argument("--sim-steps", type=int, default=80)
+    parser.add_argument("--sim-steps", type=int, default=100)
     parser.add_argument("--circle-radius", type=float, default=1)
     parser.add_argument("--circle-period-steps", type=int, default=60)
     parser.add_argument(
