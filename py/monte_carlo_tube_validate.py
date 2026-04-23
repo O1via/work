@@ -27,6 +27,7 @@ from rtmpc_constants import (
     base_state_bounds,
     disturbance_half_bounds,
     input_cost_matrix,
+    sample_process_disturbance,
     state_cost_matrix,
 )
 
@@ -190,6 +191,7 @@ def build_context(
         "gamma_u_per_dim": gamma_u_per_dim,
         "bottleneck_x_dim": np.array([bottleneck_x_idx], dtype=int),
         "bottleneck_u_dim": np.array([bottleneck_u_idx], dtype=int),
+        "dynamics": dynamics,
         "disturbance_mode": disturbance_mode,
         "force_bound_mg": np.array([float(force_bound_mg)]),
         "dt": np.array([float(sim.dt)]),
@@ -283,40 +285,16 @@ def run_monte_carlo(
             u = ubar0 + K @ (x - xbar0)
             u = np.clip(u, ctx["u_min_base"], ctx["u_max_base"])
 
-            if disturbance_mode == "force_only":
-                # 论文 Eq.(33) ：
-                # fext ~ U(0, fmax), theta ~ U(0, pi), phi ~ U(0, 2pi)
-                # [an, ae, ad] = fext * [cos(phi)sin(theta), sin(phi)sin(theta), cos(theta)]
-                amax = float(force_bound_mg) * 9.80665 * float(disturbance_scale)
-                a_mag = rng.uniform(0.0, amax)
-                theta = rng.uniform(0.0, np.pi)
-                phi = rng.uniform(0.0, 2.0 * np.pi)
-                a = np.array(
-                    [
-                        a_mag * np.cos(phi) * np.sin(theta),
-                        a_mag * np.sin(phi) * np.sin(theta),
-                        a_mag * np.cos(theta),
-                    ],
-                    dtype=float,
-                )
-
-                d = np.zeros_like(w_half)
-                if n >= 6:
-                    # x=[pn,pe,vn,ve,pd,vd,phi,theta]
-                    d[0] = 0.5 * dt * dt * a[0]
-                    d[1] = 0.5 * dt * dt * a[1]
-                    d[2] = dt * a[0]
-                    d[3] = dt * a[1]
-                    d[4] = 0.5 * dt * dt * a[2]
-                    d[5] = dt * a[2]
-                else:
-                    # double_integrator: x=[px,py,vx,vy]
-                    d[0] = 0.5 * dt * dt * a[0]
-                    d[1] = 0.5 * dt * dt * a[1]
-                    d[2] = dt * a[0]
-                    d[3] = dt * a[1]
-            else:
-                d = rng.uniform(-w_half, w_half)
+            force_bound_mg_eff = float(force_bound_mg) * float(disturbance_scale)
+            d = sample_process_disturbance(
+                rng=rng,
+                dynamics=str(ctx.get("dynamics", "iris_linear")),
+                dt=dt,
+                mode=disturbance_mode,
+                force_bound_mg=force_bound_mg_eff,
+                state_dim=n,
+                w_half=w_half,
+            )
             x_next = sim.step(x, u) + d
 
             e0 = x - xbar0

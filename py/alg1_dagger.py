@@ -292,7 +292,7 @@ def main() -> None:
     parser.add_argument(
         "--disturbance-mode",
         choices=["state_box", "force_only"],
-        default="state_box",
+        default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
     parser.add_argument("--force-bound-mg", type=float, default=0.35, help="外力边界系数 c，使 ||f_ext||<=c*m*g")

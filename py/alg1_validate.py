@@ -49,6 +49,7 @@ from rtmpc_constants import (
     base_state_bounds,
     disturbance_half_bounds,
     input_cost_matrix,
+    sample_process_disturbance,
     state_cost_matrix,
 )
 
@@ -185,6 +186,9 @@ def build_validation_context(
         "m": np.array([m]),
         "gp_model": gp_model,
         "gp_beta_sigma": np.array([float(gp_beta_sigma)], dtype=float),
+        "disturbance_mode": disturbance_mode,
+        "force_bound_mg": np.array([float(force_bound_mg)], dtype=float),
+        "dt": np.array([float(sim.dt)], dtype=float),
     }
 
 # 在初始状态上添加一些随机扰动
@@ -584,7 +588,7 @@ def main() -> None:
     parser.add_argument(
         "--disturbance-mode",
         choices=["state_box", "force_only"],
-        default="state_box",
+        default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
     parser.add_argument("--force-bound-mg", type=float, default=0.35, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
@@ -707,11 +711,17 @@ def main() -> None:
             if domain == "source":
                 disturbances = np.zeros((args.sim_steps, int(ctx["n"][0])), dtype=float)
             else:
-                disturbances = episode_rng.uniform(
-                    -ctx["w_half_target"],
-                    ctx["w_half_target"],
-                    size=(args.sim_steps, int(ctx["n"][0])),
-                )
+                disturbances = np.zeros((args.sim_steps, int(ctx["n"][0])), dtype=float)
+                for tt in range(args.sim_steps):
+                    disturbances[tt] = sample_process_disturbance(
+                        rng=episode_rng,
+                        dynamics=args.dynamics,
+                        dt=float(ctx["dt"][0]),
+                        mode=str(ctx["disturbance_mode"]),
+                        force_bound_mg=float(ctx["force_bound_mg"][0]),
+                        state_dim=int(ctx["n"][0]),
+                        w_half=ctx["w_half_target"],
+                    )
 
             policy_rollout = rollout_policy(
                 model=model,

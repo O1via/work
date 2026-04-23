@@ -23,6 +23,7 @@ import scipy.sparse as sp
 from scipy.linalg import solve_discrete_are
 from gp_residual_model import VelocityResidualGP, merge_bounds
 from rtmpc_constants import (
+    sample_process_disturbance,
     base_initial_state,
     base_input_bounds,
     base_state_bounds,
@@ -495,7 +496,7 @@ def solve_rtmc_qp_paper(
 def demo(
     task: str = "tracking",
     dynamics: str = "iris_linear",
-    disturbance_mode: str = "state_box",
+    disturbance_mode: str = "force_only",
     force_bound_mg: float = 0.35,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
@@ -769,8 +770,16 @@ def demo(
         u = u_bar + K @ e
         us.append(u.copy())
 
-        # 应用控制并推进系统，并叠加有界扰动以验证鲁棒管
-        w = rng.uniform(low=-w_half, high=w_half)
+        # 应用控制并推进系统，并叠加过程扰动（与 mode 语义一致）。
+        w = sample_process_disturbance(
+            rng=rng,
+            dynamics=dynamics,
+            dt=float(sim.dt),
+            mode=disturbance_mode,
+            force_bound_mg=float(force_bound_mg),
+            state_dim=n,
+            w_half=w_half,
+        )
         x = sim.step(x, u) + w
         xs.append(x.copy())
 
@@ -850,7 +859,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--disturbance-mode",
         choices=["state_box", "force_only"],
-        default="state_box",
+        default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
     parser.add_argument("--force-bound-mg", type=float, default=0.35, help="外力边界系数 c，使 ||f_ext||<=c*m*g")

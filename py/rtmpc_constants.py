@@ -89,6 +89,99 @@ def disturbance_half_bounds(
     raise ValueError("mode 应为 'state_box' 或 'force_only'")
 
 
+def sample_force_mapped_acceleration(rng: np.random.Generator, force_bound_mg: float) -> np.ndarray:
+    """按论文常见设置采样外力映射加速度（NED 三轴）。
+
+    采样方式：
+    - 加速度幅值 a_mag ~ U(0, a_max), a_max = c*g
+    - theta ~ U(0, pi), phi ~ U(0, 2pi)
+    - a = a_mag * [cos(phi)sin(theta), sin(phi)sin(theta), cos(theta)]
+    """
+    if force_bound_mg < 0.0:
+        raise ValueError("force_bound_mg 必须 >= 0")
+    amax = float(force_bound_mg) * 9.80665
+    a_mag = rng.uniform(0.0, amax)
+    theta = rng.uniform(0.0, np.pi)
+    phi = rng.uniform(0.0, 2.0 * np.pi)
+    return np.array(
+        [
+            a_mag * np.cos(phi) * np.sin(theta),
+            a_mag * np.sin(phi) * np.sin(theta),
+            a_mag * np.cos(theta),
+        ],
+        dtype=float,
+    )
+
+
+def accel_to_state_disturbance(
+    dynamics: str,
+    dt: float,
+    accel_ned: np.ndarray,
+    state_dim: int,
+) -> np.ndarray:
+    """将 NED 加速度映射为离散状态加性扰动 d。"""
+    a = np.asarray(accel_ned, dtype=float).reshape(-1)
+    if a.size < 3:
+        raise ValueError("accel_ned 需要至少 3 维 (n,e,d)")
+    d = np.zeros(int(state_dim), dtype=float)
+    dt = float(dt)
+    dt2 = 0.5 * dt * dt
+
+    if dynamics == "double_integrator":
+        if state_dim < 4:
+            raise ValueError("double_integrator 需要 state_dim >= 4")
+        d[0] = dt2 * a[0]
+        d[1] = dt2 * a[1]
+        d[2] = dt * a[0]
+        d[3] = dt * a[1]
+        return d
+
+    if dynamics == "iris_linear":
+        if state_dim < 6:
+            raise ValueError("iris_linear 需要 state_dim >= 6")
+        # x=[pn,pe,vn,ve,pd,vd,phi,theta]
+        d[0] = dt2 * a[0]
+        d[1] = dt2 * a[1]
+        d[2] = dt * a[0]
+        d[3] = dt * a[1]
+        d[4] = dt2 * a[2]
+        d[5] = dt * a[2]
+        return d
+
+    raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
+
+
+def sample_process_disturbance(
+    rng: np.random.Generator,
+    dynamics: str,
+    dt: float,
+    mode: str,
+    force_bound_mg: float,
+    state_dim: int,
+    w_half: np.ndarray = None,
+) -> np.ndarray:
+    """统一采样接口：
+    - state_box: 盒均匀采样 d ~ U[-w_half, w_half]
+    - force_only: 先采样外力映射加速度，再映射到状态扰动 d
+    """
+    if mode == "state_box":
+        if w_half is None:
+            raise ValueError("state_box 模式需要提供 w_half")
+        w_half = np.asarray(w_half, dtype=float).reshape(-1)
+        if w_half.size != int(state_dim):
+            raise ValueError("w_half 维度与 state_dim 不一致")
+        return rng.uniform(-w_half, w_half)
+    if mode == "force_only":
+        a = sample_force_mapped_acceleration(rng, force_bound_mg=force_bound_mg)
+        return accel_to_state_disturbance(
+            dynamics=dynamics,
+            dt=dt,
+            accel_ned=a,
+            state_dim=state_dim,
+        )
+    raise ValueError("mode 应为 'state_box' 或 'force_only'")
+
+
 def base_state_bounds(dynamics: str) -> Tuple[np.ndarray, np.ndarray]:
     """返回状态盒约束 (x_min_base, x_max_base)。"""
     if dynamics == "double_integrator":
