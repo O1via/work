@@ -389,7 +389,13 @@ def cli_fit() -> None:
     parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
     parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument("--out", type=str, required=True, help="Output .npz file path")
-    parser.add_argument("--data", type=str, nargs="+", required=True, help="Transition npz files")
+    parser.add_argument(
+        "--data",
+        type=str,
+        nargs="+",
+        default=["gp_data/transitions.npz"],
+        help="Transition npz files (default: gp_data/transitions.npz)",
+    )
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-opt", action="store_true", help="Disable GP hyperparameter optimization")
