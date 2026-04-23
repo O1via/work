@@ -1,0 +1,9 @@
+# Track only the py directory and this ignore file.
+/*
+!/py/
+!/py/**
+!.gitignore
+
+# Ignore Python bytecode/cache artifacts under py.
+py/**/__pycache__/
+py/**/*.pyc

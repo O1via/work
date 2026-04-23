@@ -1,9 +1,0 @@
-{
-    "ros.distro": "noetic",
-    "ROS2.distro": "noetic",
-    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-    "code-runner.runInTerminal": true,
-    "code-runner.executorMap": {
-        "python": "/home/zxy/work/.venv/bin/python -u"
-    }
-}
