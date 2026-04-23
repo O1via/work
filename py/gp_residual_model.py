@@ -183,12 +183,13 @@ class RbfGp1D:
 class VelocityResidualGP:
     """GP residual model using inertial-frame velocity features.
 
-    Input features:
-    - double_integrator: [vx, vy]
-    - iris_linear: [vn, ve, vd]
+    Current training mode (axis-wise, Torrente-style):
+    - each output axis uses only its own velocity component as GP input.
+      e.g. iris_linear: a_n <- v_n, a_e <- v_e, a_d <- v_d.
 
-    Outputs:
-    - residual acceleration components in the same inertial frame.
+    Backward compatibility:
+    - previously trained models that used full velocity vector input for each
+      axis are still supported at inference time.
     """
 
     def __init__(self, dynamics: str, dt: float, state_dim: int, axis_models: Sequence[RbfGp1D]):
@@ -238,13 +239,13 @@ class VelocityResidualGP:
         x_nom_next = x_t @ A.T + u_t @ B.T
         dx_res = x_tp1 - x_nom_next
         accel_res = dx_res[:, vel_idx] / float(dt)
-        feat = x_t[:, vel_idx]
-
         models: List[RbfGp1D] = []
         for j in range(vel_idx.size):
+            # Axis-wise feature: each GP only sees its own velocity component.
+            feat_j = x_t[:, vel_idx[j] : vel_idx[j] + 1]
             models.append(
                 RbfGp1D.fit(
-                    feat,
+                    feat_j,
                     accel_res[:, j],
                     optimize_hyperparams=optimize_hyperparams,
                     max_points=max_points_per_axis,
@@ -259,8 +260,20 @@ class VelocityResidualGP:
             raise ValueError("velocity feature dimension mismatch")
         means = []
         stds = []
-        for gp in self.axis_models:
-            mu, sd = gp.predict(vel_inertial)
+        for j, gp in enumerate(self.axis_models):
+            feat_dim = int(gp.x_mean.size)
+            if feat_dim == 1:
+                # Axis-wise model: a_j <- v_j
+                gp_in = vel_inertial[:, j : j + 1]
+            elif feat_dim == vel_inertial.shape[1]:
+                # Legacy model: a_j <- [v_1, ..., v_k]
+                gp_in = vel_inertial
+            else:
+                raise ValueError(
+                    f"GP axis {j} feature dim mismatch: model expects {feat_dim}, "
+                    f"but runtime velocity dim is {vel_inertial.shape[1]}"
+                )
+            mu, sd = gp.predict(gp_in)
             means.append(mu.reshape(-1, 1))
             stds.append(sd.reshape(-1, 1))
         mean_acc = np.hstack(means)
@@ -311,15 +324,27 @@ class VelocityResidualGP:
         if grid_points_per_dim < 2:
             grid_points_per_dim = 2
 
-        axis_vals = []
-        for idx in self.vel_idx:
-            lo = float(x_min[idx])
-            hi = float(x_max[idx])
-            axis_vals.append(np.linspace(lo, hi, grid_points_per_dim))
-
-        points = np.array(list(itertools.product(*axis_vals)), dtype=float).reshape(-1, k)
-        _, std_acc = self.predict_accel(points)
-        std_max = np.max(std_acc, axis=0)
+        # Axis-wise fast path (new training mode): evaluate each axis GP over
+        # its own velocity range only. Fallback to legacy Cartesian grid when
+        # encountering old full-feature models.
+        axiswise = all(int(gp.x_mean.size) == 1 for gp in self.axis_models)
+        if axiswise:
+            std_max = np.zeros((k,), dtype=float)
+            for j, idx in enumerate(self.vel_idx):
+                lo = float(x_min[idx])
+                hi = float(x_max[idx])
+                vals = np.linspace(lo, hi, grid_points_per_dim).reshape(-1, 1)
+                _, sd = self.axis_models[j].predict(vals)
+                std_max[j] = float(np.max(sd))
+        else:
+            axis_vals = []
+            for idx in self.vel_idx:
+                lo = float(x_min[idx])
+                hi = float(x_max[idx])
+                axis_vals.append(np.linspace(lo, hi, grid_points_per_dim))
+            points = np.array(list(itertools.product(*axis_vals)), dtype=float).reshape(-1, k)
+            _, std_acc = self.predict_accel(points)
+            std_max = np.max(std_acc, axis=0)
 
         out = np.zeros((self.state_dim,), dtype=float)
         dt = float(self.dt)
@@ -417,7 +442,17 @@ def _print_training_report(
     )
     for j, gp in enumerate(model.axis_models):
         y = accel_res[:, j]
-        mu, sd = gp.predict(feat)
+        feat_dim = int(gp.x_mean.size)
+        if feat_dim == 1:
+            gp_in = feat[:, j : j + 1]
+        elif feat_dim == feat.shape[1]:
+            gp_in = feat
+        else:
+            raise ValueError(
+                f"GP axis {j} feature dim mismatch in report: model expects {feat_dim}, "
+                f"but runtime velocity dim is {feat.shape[1]}"
+            )
+        mu, sd = gp.predict(gp_in)
         err = mu - y
         rmse = float(np.sqrt(np.mean(err * err)))
         mae = float(np.mean(np.abs(err)))
@@ -431,7 +466,7 @@ def _print_training_report(
         ls_s = np.array2string(ls, precision=5, separator=", ")
         used = int(gp.x_train_n.shape[0])
 
-        print(f"[gp][axis {j}] label={labels[j]} used_points={used}")
+        print(f"[gp][axis {j}] label={labels[j]} used_points={used} input_dim={feat_dim}")
         print(
             f"  sigma_f={sigma_f:.6g}, sigma_n={sigma_n:.6g}, sigma_n/sigma_f="
             f"{(sigma_n / max(sigma_f, 1e-12)):.6g}"
