@@ -388,7 +388,12 @@ def cli_fit() -> None:
     parser = argparse.ArgumentParser(description="Fit inertial-velocity GP residual model from transition npz files")
     parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
     parser.add_argument("--dt", type=float, default=0.1)
-    parser.add_argument("--out", type=str, required=True, help="Output .npz file path")
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="gp_model/iris_linear_residual_gp.npz",
+        help="Output .npz file path (default: gp_model/iris_linear_residual_gp.npz)",
+    )
     parser.add_argument(
         "--data",
         type=str,

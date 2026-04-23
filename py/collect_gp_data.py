@@ -477,7 +477,7 @@ def main() -> None:
     print(
         "python py/gp_residual_model.py "
         f"--dynamics {args.dynamics} --dt {float(sim.dt):.3f} "
-        f"--data {out_path} --out gp_models/{args.dynamics}_residual_gp.npz"
+        f"--data {out_path} --out gp_model/{args.dynamics}_residual_gp.npz"
     )
 
 
