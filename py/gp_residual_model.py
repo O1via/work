@@ -384,6 +384,67 @@ def _load_transition_npz(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.nda
     raise ValueError(f"{npz_path} missing transition keys; expected (x_t,u_t,x_tp1) or (xs,us)")
 
 
+def _axis_labels(dynamics: str, axis_count: int) -> List[str]:
+    if dynamics == "double_integrator":
+        base = ["a_x", "a_y"]
+    elif dynamics == "iris_linear":
+        base = ["a_n", "a_e", "a_d"]
+    else:
+        base = []
+    if len(base) >= axis_count:
+        return base[:axis_count]
+    return [f"axis_{i}" for i in range(axis_count)]
+
+
+def _print_training_report(
+    model: "VelocityResidualGP",
+    A: np.ndarray,
+    B: np.ndarray,
+    x_t: np.ndarray,
+    u_t: np.ndarray,
+    x_tp1: np.ndarray,
+) -> None:
+    x_nom_next = x_t @ A.T + u_t @ B.T
+    dx_res = x_tp1 - x_nom_next
+    accel_res = dx_res[:, model.vel_idx] / float(model.dt)
+    feat = x_t[:, model.vel_idx]
+
+    labels = _axis_labels(model.dynamics, len(model.axis_models))
+    print("[gp][report] --------------------------------------------------")
+    print(
+        f"[gp][report] samples_total={x_t.shape[0]}, feature_dim={feat.shape[1]}, "
+        f"axis_count={len(model.axis_models)}"
+    )
+    for j, gp in enumerate(model.axis_models):
+        y = accel_res[:, j]
+        mu, sd = gp.predict(feat)
+        err = mu - y
+        rmse = float(np.sqrt(np.mean(err * err)))
+        mae = float(np.mean(np.abs(err)))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        ss_res = float(np.sum(err ** 2))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
+
+        sigma_f = float(np.exp(gp.log_sigma_f))
+        sigma_n = float(np.exp(gp.log_sigma_n))
+        ls = np.exp(gp.log_lengthscales)
+        ls_s = np.array2string(ls, precision=5, separator=", ")
+        used = int(gp.x_train_n.shape[0])
+
+        print(f"[gp][axis {j}] label={labels[j]} used_points={used}")
+        print(
+            f"  sigma_f={sigma_f:.6g}, sigma_n={sigma_n:.6g}, sigma_n/sigma_f="
+            f"{(sigma_n / max(sigma_f, 1e-12)):.6g}"
+        )
+        print(f"  lengthscales={ls_s}")
+        print(
+            f"  target_mean={float(np.mean(y)):.6g}, target_std={float(np.std(y)):.6g}, "
+            f"pred_std_mean={float(np.mean(sd)):.6g}"
+        )
+        print(f"  fit_rmse={rmse:.6g}, fit_mae={mae:.6g}, fit_r2={r2:.6g}")
+    print("[gp][report] --------------------------------------------------")
+
+
 def cli_fit() -> None:
     parser = argparse.ArgumentParser(description="Fit inertial-velocity GP residual model from transition npz files")
     parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
@@ -404,6 +465,7 @@ def cli_fit() -> None:
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-opt", action="store_true", help="Disable GP hyperparameter optimization")
+    parser.add_argument("--no-report", action="store_true", help="Disable training report printout")
     args = parser.parse_args()
 
     from rtmpc_demo import DoubleIntegrator, LinearIrisHover
@@ -444,6 +506,15 @@ def cli_fit() -> None:
     print(f"[gp] saved model: {args.out}")
     print(f"[gp] samples: {x_t_all.shape[0]}")
     print(f"[gp] dynamics={args.dynamics}, dt={args.dt}")
+    if not args.no_report:
+        _print_training_report(
+            model=model,
+            A=A,
+            B=B,
+            x_t=x_t_all,
+            u_t=u_t_all,
+            x_tp1=x_tp1_all,
+        )
 
 
 if __name__ == "__main__":
