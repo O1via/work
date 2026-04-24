@@ -7,3 +7,6 @@
 # Ignore Python bytecode/cache artifacts under py.
 py/**/__pycache__/
 py/**/*.pyc
+
+git add -A && git commit -m "chore: track only py directory"
+
