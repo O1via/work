@@ -73,7 +73,7 @@ def disturbance_half_bounds(
     dynamics: str,
     dt: float = 0.1,
     mode: str = "state_box",
-    force_bound_mg: float = 0.35,
+    force_bound_mg: float = 0.05,
 ) -> np.ndarray:
     """返回扰动盒半宽 w_half。
 
@@ -192,8 +192,8 @@ def base_state_bounds(dynamics: str) -> Tuple[np.ndarray, np.ndarray]:
     if dynamics == "iris_linear":
         # x=[pn,pe,vn,ve,pd,vd,phi,theta] (NED)
         return (
-            np.array([-5.0, -5.0, -6.0, -6.0, -5.0, -3.0, -0.6, -0.6], dtype=float),
-            np.array([5.0, 5.0, 6.0, 6.0, -0.2, 3.0, 0.6, 0.6], dtype=float),
+            np.array([-8.0, -8.0, -8.0, -8.0, -5.0, -3.0, -1.0, -1.0], dtype=float),
+            np.array([8.0, 8.0, 8.0, 8.0, -0.2, 3.0, 1.0, 1.0], dtype=float),
         )
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 
@@ -208,8 +208,8 @@ def base_input_bounds(dynamics: str, mass: float = IRIS_MASS_DEFAULT, m: int = 0
     if dynamics == "iris_linear":
         t_max = 4.0 * IRIS_KF * (IRIS_W_MAX ** 2)
         t_hover = float(mass) * 9.81
-        u_min = np.array([-0.7 * t_hover, -0.7, -0.7], dtype=float)
-        u_max = np.array([max(0.1, t_max - t_hover), 0.7, 0.7], dtype=float)
+        u_min = np.array([-0.7 * t_hover, -1.0, -1.0], dtype=float)
+        u_max = np.array([max(0.1, t_max - t_hover), 1.0, 1.0], dtype=float)
         return u_min, u_max
 
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
@@ -221,5 +221,5 @@ def base_initial_state(dynamics: str) -> np.ndarray:
         return np.array([1.0, 0.5, 0.0, 0.0], dtype=float)
     if dynamics == "iris_linear":
         # 默认初始高度约 1m（NED: pd=-1）
-        return np.array([1.0, 0.5, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=float)
+        return np.array([4.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=float)
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")

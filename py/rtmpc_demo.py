@@ -63,8 +63,8 @@ def build_circle_reference(
     x0: np.ndarray,
     total_len: int,
     dt: float,
-    radius: float = 1.0,
-    period_steps: int = 60,
+    radius: float = 4.0,
+    period_steps: int = 63,
 ) -> np.ndarray:
     """生成圆形参考轨迹（在 x-y 平面做匀速圆周运动 ）。
 
@@ -92,6 +92,53 @@ def build_circle_reference(
     vel = radius * omega * np.stack([-np.sin(theta), np.cos(theta)], axis=1)
 
     return np.hstack([pos, vel])
+
+
+def apply_tracking_profile_iris(
+    x_ref: np.ndarray,
+    dt: float,
+    tracking_profile: str,
+    g: float = 9.81,
+    phi_bounds: Optional[Tuple[float, float]] = None,
+    theta_bounds: Optional[Tuple[float, float]] = None,
+) -> np.ndarray:
+    """为 8 维 iris 参考轨迹应用两套模式。
+
+    - paper_baseline: 与论文线性设置一致，phi/theta 参考恒为 0。
+    - high_speed_extension: 根据速度差分得到期望加速度，并反解 phi/theta 参考。
+    """
+    ref = np.asarray(x_ref, dtype=float)
+    if ref.ndim != 2 or ref.shape[1] < 8:
+        raise ValueError("x_ref 形状非法，期望 (T,>=8)")
+    if dt <= 0.0:
+        raise ValueError("dt 必须为正")
+
+    out = ref.copy()
+    if tracking_profile == "paper_baseline":
+        out[:, 6] = 0.0
+        out[:, 7] = 0.0
+        return out
+    if tracking_profile != "high_speed_extension":
+        raise ValueError("tracking_profile 应为 'paper_baseline' 或 'high_speed_extension'")
+
+    if out.shape[0] >= 2:
+        a_n = np.gradient(out[:, 2], float(dt), edge_order=1)
+        a_e = np.gradient(out[:, 3], float(dt), edge_order=1)
+    else:
+        a_n = np.zeros((out.shape[0],), dtype=float)
+        a_e = np.zeros((out.shape[0],), dtype=float)
+
+    theta_ref = a_n / float(g)
+    phi_ref = a_e / float(g)
+
+    if phi_bounds is not None:
+        phi_ref = np.clip(phi_ref, float(phi_bounds[0]), float(phi_bounds[1]))
+    if theta_bounds is not None:
+        theta_ref = np.clip(theta_ref, float(theta_bounds[0]), float(theta_bounds[1]))
+
+    out[:, 6] = phi_ref
+    out[:, 7] = theta_ref
+    return out
 
 
 
@@ -439,7 +486,12 @@ def solve_rtmc_qp_paper(
     x_lb[:n] = np.maximum(x_lb[:n], x0_lb)
     x_ub[:n] = np.minimum(x_ub[:n], x0_ub)
     if np.any(x_ub[:n] <= x_lb[:n]):
-        raise ValueError("tube 初值约束与状态约束冲突")
+        bad_idx = np.where(x_ub[:n] <= x_lb[:n])[0].tolist()
+        details = ", ".join(
+            f"dim={i}, lb={x_lb[i]:.6f}, ub={x_ub[i]:.6f}, x_meas={x_meas[i]:.6f}, z={z_half[i]:.6f}"
+            for i in bad_idx
+        )
+        raise ValueError(f"tube 初值约束与状态约束冲突: {details}")
 
     lb[m * N :] = x_lb
     ub[m * N :] = x_ub
@@ -497,14 +549,15 @@ def demo(
     task: str = "tracking",
     dynamics: str = "iris_linear",
     disturbance_mode: str = "force_only",
-    force_bound_mg: float = 0.35,
+    force_bound_mg: float = 0.05,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
     gp_shrink_mode: str = "none",
     tracking_shape: str = "line",
+    tracking_profile: str = "paper_baseline",
     sim_steps: int = 60,
-    circle_radius: float = 1.0,
-    circle_period_steps: int = 60,
+    circle_radius: float = 4.0,
+    circle_period_steps: int = 63,
     plot_path: Optional[str] = None,
     augment_mode: str = "dense",
     include_onpolicy_teacher: bool = True,
@@ -519,7 +572,6 @@ def demo(
             - "line": 位置从起点匀速移动到目标点，然后保持
             - "circle": 圆形参考轨迹（在 x-y 平面做匀速圆周运动）
     """
-
     if dynamics == "double_integrator":
         sim = DoubleIntegrator(dt=0.1)
     elif dynamics == "iris_linear":
@@ -620,8 +672,12 @@ def demo(
         if n == 8:
             x_ref_all[:, 4] = float(x0[4])
     elif task == "tracking":
+        if tracking_profile not in ("paper_baseline", "high_speed_extension"):
+            raise ValueError("tracking_profile 应为 'paper_baseline' 或 'high_speed_extension'")
         total_len = int(sim_steps) + N + 1  # 需要可切片的参考长度（t..t+N）
         if tracking_shape == "circle":
+            if circle_period_steps <= 0:
+                raise ValueError("circle_period_steps 必须为正")
             if n == 4:
                 # 圆形匀速运动需要向心加速度 a = r * omega^2。
                 # 若收紧后的输入上限不足以提供该加速度，则跟踪会明显偏离（这是物理/约束不可行）。
@@ -656,6 +712,14 @@ def demo(
                 x_ref_all[:, 2] = xy_ref[:, 2]
                 x_ref_all[:, 3] = xy_ref[:, 3]
                 x_ref_all[:, 4] = float(x0[4])
+                x_ref_all = apply_tracking_profile_iris(
+                    x_ref_all,
+                    dt=float(sim.dt),
+                    tracking_profile=tracking_profile,
+                    g=float(sim.g),
+                    phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
+                    theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
+                )
 
             # 给定与轨迹相同的初始状态。
             x0 = x_ref_all[0].copy()
@@ -682,6 +746,14 @@ def demo(
                 x_ref_all[:, 0:2] = pos_ref
                 x_ref_all[:, 2:4] = vel_ref
                 x_ref_all[:, 4] = float(x0[4])
+                x_ref_all = apply_tracking_profile_iris(
+                    x_ref_all,
+                    dt=float(sim.dt),
+                    tracking_profile=tracking_profile,
+                    g=float(sim.g),
+                    phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
+                    theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
+                )
         else:
             raise ValueError("tracking_shape 应为 'line' 或 'circle'")
     else:
@@ -862,7 +934,7 @@ if __name__ == "__main__":
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force-bound-mg", type=float, default=0.35, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force-bound-mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--gp-model", type=str, default=None, help="Optional GP residual model (.npz)")
     parser.add_argument("--gp-beta-sigma", type=float, default=2.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
@@ -872,9 +944,15 @@ if __name__ == "__main__":
         help="How GP uncertainty bound is merged with disturbance bound for tube sizing.",
     )
     parser.add_argument("--tracking-shape", choices=["line", "circle"], default="circle")
+    parser.add_argument(
+        "--tracking-profile",
+        choices=["paper_baseline", "high_speed_extension"],
+        default="paper_baseline",
+        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
+    )
     parser.add_argument("--sim-steps", type=int, default=100)
-    parser.add_argument("--circle-radius", type=float, default=1)
-    parser.add_argument("--circle-period-steps", type=int, default=60)
+    parser.add_argument("--circle-radius", type=float, default=4.0)
+    parser.add_argument("--circle-period-steps", type=int, default=63)
     parser.add_argument(
         "--augment-mode",
         choices=["dense", "sparse"],
@@ -903,6 +981,7 @@ if __name__ == "__main__":
         gp_beta_sigma=float(args.gp_beta_sigma),
         gp_shrink_mode=args.gp_shrink_mode,
         tracking_shape=args.tracking_shape,
+        tracking_profile=args.tracking_profile,
         sim_steps=args.sim_steps,
         circle_radius=args.circle_radius,
         circle_period_steps=args.circle_period_steps,

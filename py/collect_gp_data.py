@@ -30,6 +30,7 @@ import numpy as np
 from rtmpc_demo import (
     DoubleIntegrator,
     LinearIrisHover,
+    apply_tracking_profile_iris,
     build_circle_reference,
     compute_infinite_lqr,
     solve_rtmc_qp_paper,
@@ -48,6 +49,7 @@ from rtmpc_constants import (
 def build_reference(
     task: str,
     tracking_shape: str,
+    tracking_profile: str,
     x0: np.ndarray,
     sim_steps: int,
     horizon: int,
@@ -58,6 +60,8 @@ def build_reference(
     line_goal_e: float,
 ) -> np.ndarray:
     """构造参考轨迹，语义与 demo 保持一致。"""
+    if tracking_profile not in ("paper_baseline", "high_speed_extension"):
+        raise ValueError("tracking_profile 应为 'paper_baseline' 或 'high_speed_extension'")
     n = x0.shape[0]
     total_len = int(sim_steps) + int(horizon) + 1
 
@@ -71,13 +75,16 @@ def build_reference(
         raise ValueError("task 应为 'point' 或 'tracking'")
 
     if tracking_shape == "circle":
+        period_steps = int(circle_period_steps)
+        if period_steps <= 0:
+            raise ValueError("circle_period_steps 必须为正")
         if n == 4:
             return build_circle_reference(
                 x0=x0,
                 total_len=total_len,
                 dt=float(dt),
                 radius=float(circle_radius),
-                period_steps=int(circle_period_steps),
+                period_steps=period_steps,
             )
         if n == 8:
             xy_ref = build_circle_reference(
@@ -85,7 +92,7 @@ def build_reference(
                 total_len=total_len,
                 dt=float(dt),
                 radius=float(circle_radius),
-                period_steps=int(circle_period_steps),
+                period_steps=period_steps,
             )
             out = np.zeros((total_len, n), dtype=float)
             out[:, 0] = xy_ref[:, 0]
@@ -93,22 +100,30 @@ def build_reference(
             out[:, 2] = xy_ref[:, 2]
             out[:, 3] = xy_ref[:, 3]
             out[:, 4] = float(x0[4])
+            x_min_base, x_max_base = base_state_bounds("iris_linear")
+            out = apply_tracking_profile_iris(
+                out,
+                dt=float(dt),
+                tracking_profile=tracking_profile,
+                phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
+                theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
+            )
             return out
         raise ValueError(f"unsupported state dimension for circle tracking: n={n}")
 
     if tracking_shape == "line":
         p_start = x0[:2].copy()
         p_goal = np.array([float(line_goal_n), float(line_goal_e)], dtype=float)
-        t_move = max(1, int(sim_steps))
+        t_steps = max(1, int(sim_steps))
 
-        alphas = np.linspace(0.0, 1.0, t_move + 1)
+        alphas = np.linspace(0.0, 1.0, t_steps + 1)
         pos_move = (1.0 - alphas)[:, None] * p_start[None, :] + alphas[:, None] * p_goal[None, :]
-        pos_ref = np.vstack([pos_move, np.tile(p_goal[None, :], (total_len - (t_move + 1), 1))])
-        v_const = (p_goal - p_start) / (t_move * float(dt))
+        pos_ref = np.vstack([pos_move, np.tile(p_goal[None, :], (total_len - (t_steps + 1), 1))])
+        v_const = (p_goal - p_start) / (t_steps * float(dt))
         vel_ref = np.vstack(
             [
-                np.tile(v_const[None, :], (t_move + 1, 1)),
-                np.zeros((total_len - (t_move + 1), 2), dtype=float),
+                np.tile(v_const[None, :], (t_steps + 1, 1)),
+                np.zeros((total_len - (t_steps + 1), 2), dtype=float),
             ]
         )
 
@@ -119,6 +134,14 @@ def build_reference(
             out[:, 0:2] = pos_ref
             out[:, 2:4] = vel_ref
             out[:, 4] = float(x0[4])
+            x_min_base, x_max_base = base_state_bounds("iris_linear")
+            out = apply_tracking_profile_iris(
+                out,
+                dt=float(dt),
+                tracking_profile=tracking_profile,
+                phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
+                theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
+            )
             return out
         raise ValueError(f"unsupported state dimension for line tracking: n={n}")
 
@@ -259,11 +282,17 @@ def main() -> None:
     parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
     parser.add_argument("--task", choices=["point", "tracking"], default="tracking")
     parser.add_argument("--tracking-shape", choices=["line", "circle"], default="circle")
+    parser.add_argument(
+        "--tracking-profile",
+        choices=["paper_baseline", "high_speed_extension"],
+        default="paper_baseline",
+        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
+    )
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--sim-steps", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument("--disturbance-mode", choices=["state_box", "force_only"], default="force_only")
-    parser.add_argument("--force-bound-mg", type=float, default=0.35)
+    parser.add_argument("--force-bound-mg", type=float, default=0.05)
     parser.add_argument("--state-box-scale", type=float, default=1.0)
     parser.add_argument("--qp-state-bounds", choices=["base", "none"], default="base")
     parser.add_argument("--qp-input-bounds", choices=["base", "none"], default="base")
@@ -274,8 +303,8 @@ def main() -> None:
     parser.add_argument("--vel-jitter", type=float, default=0.1)
     parser.add_argument("--pd-jitter", type=float, default=0.15)
     parser.add_argument("--vd-jitter", type=float, default=0.05)
-    parser.add_argument("--circle-radius", type=float, default=1.0)
-    parser.add_argument("--circle-period-steps", type=int, default=60)
+    parser.add_argument("--circle-radius", type=float, default=4.0)
+    parser.add_argument("--circle-period-steps", type=int, default=63, help="圆轨迹每圈步数")
     parser.add_argument("--line-goal-n", type=float, default=0.0)
     parser.add_argument("--line-goal-e", type=float, default=0.0)
     parser.add_argument(
@@ -359,6 +388,7 @@ def main() -> None:
         x_ref_all = build_reference(
             task=args.task,
             tracking_shape=args.tracking_shape,
+            tracking_profile=args.tracking_profile,
             x0=x0,
             sim_steps=int(args.sim_steps),
             horizon=int(args.horizon),
@@ -451,6 +481,7 @@ def main() -> None:
         dynamics=np.array([args.dynamics]),
         task=np.array([args.task]),
         tracking_shape=np.array([args.tracking_shape]),
+        tracking_profile=np.array([args.tracking_profile]),
         disturbance_mode=np.array([args.disturbance_mode]),
         force_bound_mg=np.array([float(args.force_bound_mg)], dtype=float),
         dt=np.array([float(sim.dt)], dtype=float),

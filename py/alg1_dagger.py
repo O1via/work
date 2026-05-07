@@ -101,6 +101,7 @@ if _THIS_DIR not in sys.path:
 from rtmpc_demo import (
     DoubleIntegrator,
     LinearIrisHover,
+    apply_tracking_profile_iris,
     build_circle_reference,
     compute_infinite_lqr,
     compute_rpi_box,
@@ -252,7 +253,14 @@ def train_one_cycle(
     return history
 
 
-def make_reference(task: str, x0: np.ndarray, N: int, sim_dt: float, total_steps: int) -> np.ndarray:
+def make_reference(
+    task: str,
+    x0: np.ndarray,
+    N: int,
+    sim_dt: float,
+    total_steps: int,
+    tracking_profile: str = "paper_baseline",
+) -> np.ndarray:
     n = x0.shape[0]
     if task == "point":
         return np.zeros((total_steps + N + 1, n))
@@ -261,20 +269,44 @@ def make_reference(task: str, x0: np.ndarray, N: int, sim_dt: float, total_steps
 
     # 为了与 rtmpc_demo 的 tracking 任务保持一致，这里直接复用其圆形参考轨迹生成逻辑。
     total_len = total_steps + N + 1
+    if tracking_profile not in ("paper_baseline", "high_speed_extension"):
+        raise ValueError("tracking_profile must be paper_baseline or high_speed_extension")
+    circle_radius = 4.0
+    period_steps = 63
     if n == 4:
-        return build_circle_reference(x0=x0, total_len=total_len, dt=float(sim_dt))
+        return build_circle_reference(
+            x0=x0,
+            total_len=total_len,
+            dt=float(sim_dt),
+            radius=circle_radius,
+            period_steps=period_steps,
+        )
 
     # 8维线性 iris 模型（PX4/NED）：x=[pn,pe,vn,ve,pd,vd,phi,theta]
     # 参考轨迹在 n-e 平面画圆，d(Down) 保持常值，倾角参考置零。
     if n == 8:
-        xy_ref = build_circle_reference(x0=x0[:4], total_len=total_len, dt=float(sim_dt))
+        xy_ref = build_circle_reference(
+            x0=x0[:4],
+            total_len=total_len,
+            dt=float(sim_dt),
+            radius=circle_radius,
+            period_steps=period_steps,
+        )
         out = np.zeros((total_len, n), dtype=float)
         out[:, 0] = xy_ref[:, 0]  # pn
         out[:, 1] = xy_ref[:, 1]  # pe
         out[:, 2] = xy_ref[:, 2]  # vn
         out[:, 3] = xy_ref[:, 3]  # ve
         out[:, 4] = float(x0[4])  # pd (Down)
-        # vd, phi, theta 参考保持 0
+        x_min_base, x_max_base = base_state_bounds("iris_linear")
+        out = apply_tracking_profile_iris(
+            out,
+            dt=float(sim_dt),
+            tracking_profile=tracking_profile,
+            g=9.81,
+            phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
+            theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
+        )
         return out
 
     raise ValueError(f"unsupported state dimension for reference generation: n={n}")
@@ -295,9 +327,15 @@ def main() -> None:
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force-bound-mg", type=float, default=0.35, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force-bound-mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--cycles", type=int, default=8, help="Number of Algorithm 1 iterations")
     parser.add_argument("--sim-steps", type=int, default=100, help="Receding-horizon steps per cycle")
+    parser.add_argument(
+        "--tracking-profile",
+        choices=["paper_baseline", "high_speed_extension"],
+        default="paper_baseline",
+        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
+    )
     parser.add_argument("--horizon", type=int, default=30, help="MPC prediction horizon N")
     parser.add_argument("--augment", choices=["dense", "sparse"], default="dense")
 
@@ -422,7 +460,14 @@ def main() -> None:
     sim_steps = int(args.sim_steps)
     cycles = int(args.cycles)
 
-    x_ref_all = make_reference(args.task, x0=x0, N=N, sim_dt=sim.dt, total_steps=sim_steps)
+    x_ref_all = make_reference(
+        args.task,
+        x0=x0,
+        N=N,
+        sim_dt=sim.dt,
+        total_steps=sim_steps,
+        tracking_profile=args.tracking_profile,
+    )
 
     # 与 rtmpc_demo 的 circle tracking 行为一致：将初始状态对齐到参考的第一个点。
     if args.task == "tracking":
@@ -586,6 +631,7 @@ def main() -> None:
                 "dynamics": args.dynamics,
                 "horizon": int(args.horizon),
                 "sim_steps": int(args.sim_steps),
+                "tracking_profile": args.tracking_profile,
                 "cycle": cycle_idx + 1,
             },
             ckpt_path,

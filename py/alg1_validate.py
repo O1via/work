@@ -78,6 +78,7 @@ def build_validation_context(
     task: str,
     sim_steps: int,
     horizon: int,
+    tracking_profile: str,
     dynamics: str,
     disturbance_mode: str,
     force_bound_mg: float,
@@ -156,7 +157,14 @@ def build_validation_context(
         u_min_base, u_max_base, u_half, name="input"
     )
 
-    x_ref_all = make_reference(task, x0=x0_base, N=horizon, sim_dt=sim.dt, total_steps=sim_steps)
+    x_ref_all = make_reference(
+        task,
+        x0=x0_base,
+        N=horizon,
+        sim_dt=sim.dt,
+        total_steps=sim_steps,
+        tracking_profile=tracking_profile,
+    )
     if task == "tracking":
         x0_base = x_ref_all[0].copy()
 
@@ -184,6 +192,7 @@ def build_validation_context(
         "gamma_u": np.array([gamma_u], dtype=float),
         "n": np.array([n]),
         "m": np.array([m]),
+        "tracking_profile": np.array([tracking_profile]),
         "gp_model": gp_model,
         "gp_beta_sigma": np.array([float(gp_beta_sigma)], dtype=float),
         "disturbance_mode": disturbance_mode,
@@ -591,11 +600,17 @@ def main() -> None:
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force-bound-mg", type=float, default=0.35, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force-bound-mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--domain", choices=["source", "target", "both"], default="both")
     parser.add_argument("--episodes", type=int, default=5, help="Number of validation episodes per domain")
     parser.add_argument("--sim-steps", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument(
+        "--tracking-profile",
+        choices=["paper_baseline", "high_speed_extension"],
+        default="paper_baseline",
+        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--out-dir", type=str, default="validation_runs", help="Directory to save validation summaries and plots")
@@ -637,6 +652,7 @@ def main() -> None:
         task=args.task,
         sim_steps=args.sim_steps,
         horizon=args.horizon,
+        tracking_profile=args.tracking_profile,
         dynamics=args.dynamics,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
@@ -653,6 +669,7 @@ def main() -> None:
     ckpt_task = ckpt.get("task")
     ckpt_dyn = ckpt.get("dynamics")
     ckpt_horizon = ckpt.get("horizon")
+    ckpt_tracking_profile = ckpt.get("tracking_profile")
     if ckpt_task is not None and str(ckpt_task) != str(args.task):
         raise ValueError(f"checkpoint 任务不匹配：checkpoint task={ckpt_task}, 当前 task={args.task}")
     if ckpt_dyn is not None and str(ckpt_dyn) != str(args.dynamics):
@@ -660,6 +677,11 @@ def main() -> None:
     if ckpt_horizon is not None and int(ckpt_horizon) != int(args.horizon):
         raise ValueError(
             f"checkpoint 预测时域不匹配：checkpoint horizon={ckpt_horizon}, 当前 horizon={args.horizon}"
+        )
+    if ckpt_tracking_profile is not None and str(ckpt_tracking_profile) != str(args.tracking_profile):
+        raise ValueError(
+            "checkpoint tracking_profile 不匹配："
+            f"checkpoint tracking_profile={ckpt_tracking_profile}, 当前 tracking_profile={args.tracking_profile}"
         )
 
     if input_dim != expected_input_dim:
@@ -701,8 +723,8 @@ def main() -> None:
         policy_avg_infer_times = []
         for ep in range(args.episodes):
             x0_ep = sample_initial_state(
-                # base_x0=base_x0,
-                base_x0=np.array([1.0, 0.5, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0], dtype=float),
+                base_x0=base_x0,
+                # base_x0=np.array([1.0, 0.5, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0], dtype=float),
                 rng=episode_rng,
                 pos_jitter=args.init_pos_jitter,
                 vel_jitter=args.init_vel_jitter,

@@ -37,6 +37,7 @@ def build_context(
     task: str,
     sim_steps: int,
     horizon: int,
+    tracking_profile: str,
     disturbance_mode: str,
     force_bound_mg: float,
     gp_model_path: Optional[str] = None,
@@ -157,7 +158,14 @@ def build_context(
     )
 
     x0 = base_initial_state(dynamics)
-    x_ref_all = make_reference(task, x0=x0, N=horizon, sim_dt=sim.dt, total_steps=sim_steps)
+    x_ref_all = make_reference(
+        task,
+        x0=x0,
+        N=horizon,
+        sim_dt=sim.dt,
+        total_steps=sim_steps,
+        tracking_profile=tracking_profile,
+    )
     if task == "tracking":
         x0 = x_ref_all[0].copy()
 
@@ -195,6 +203,7 @@ def build_context(
         "disturbance_mode": disturbance_mode,
         "force_bound_mg": np.array([float(force_bound_mg)]),
         "dt": np.array([float(sim.dt)]),
+        "tracking_profile": np.array([tracking_profile]),
         "gp_model": gp_model,
         "gp_beta_sigma": np.array([float(gp_beta_sigma)]),
         "gp_shrink_mode": gp_shrink_mode,
@@ -239,7 +248,7 @@ def run_monte_carlo(
     sim = ctx["sim"]
     disturbance_mode = str(ctx.get("disturbance_mode", "state_box"))
     dt = float(ctx.get("dt", np.array([0.1]))[0])
-    force_bound_mg = float(ctx.get("force_bound_mg", np.array([0.35]))[0])
+    force_bound_mg = float(ctx.get("force_bound_mg", np.array([0.05]))[0])
     gp_model = ctx.get("gp_model", None)
     gp_beta_sigma = float(ctx.get("gp_beta_sigma", np.array([2.0]))[0])
 
@@ -345,6 +354,12 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument(
+        "--tracking-profile",
+        choices=["paper_baseline", "high_speed_extension"],
+        default="paper_baseline",
+        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
+    )
     parser.add_argument("--disturbance-scale", type=float, default=1.0, help="对当前 w_half 的缩放系数")
     parser.add_argument(
         "--disturbance-mode",
@@ -355,7 +370,7 @@ def main() -> None:
     parser.add_argument(
         "--force-bound-mg",
         type=float,
-        default=0.1,
+        default=0.05,
         help="当 disturbance-mode=force_only 时生效：外力上限系数 c，使 ||f_ext||<=c*m*g。",
     )
     parser.add_argument("--gp-model", type=str, default=None, help="Optional GP residual model (.npz)")
@@ -387,6 +402,7 @@ def main() -> None:
         args.task,
         args.sim_steps,
         args.horizon,
+        tracking_profile=args.tracking_profile,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
         gp_model_path=args.gp_model,
@@ -413,6 +429,7 @@ def main() -> None:
             "episodes": int(args.episodes),
             "sim_steps": int(args.sim_steps),
             "horizon": int(args.horizon),
+            "tracking_profile": args.tracking_profile,
             "disturbance_scale": float(args.disturbance_scale),
             "disturbance_mode": args.disturbance_mode,
             "force_bound_mg": float(args.force_bound_mg),
