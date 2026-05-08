@@ -494,8 +494,8 @@ def cli_fit() -> None:
         "--data",
         type=str,
         nargs="+",
-        default=["gp_data/transitions.npz"],
-        help="Transition npz files (default: gp_data/transitions.npz)",
+        default=["gp_data/transitions_band3to5.npz"],
+        help="Transition npz files (default: gp_data/transitions_band3to5.npz)",
     )
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
