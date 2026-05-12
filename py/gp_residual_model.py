@@ -428,6 +428,7 @@ def _print_training_report(
     x_t: np.ndarray,
     u_t: np.ndarray,
     x_tp1: np.ndarray,
+    tag: str = "train",
 ) -> None:
     x_nom_next = x_t @ A.T + u_t @ B.T
     dx_res = x_tp1 - x_nom_next
@@ -436,6 +437,7 @@ def _print_training_report(
 
     labels = _axis_labels(model.dynamics, len(model.axis_models))
     print("[gp][report] --------------------------------------------------")
+    print(f"[gp][report] split={tag}")
     print(
         f"[gp][report] samples_total={x_t.shape[0]}, feature_dim={feat.shape[1]}, "
         f"axis_count={len(model.axis_models)}"
@@ -494,13 +496,30 @@ def cli_fit() -> None:
         "--data",
         type=str,
         nargs="+",
-        default=["gp_data/transitions_band3to5.npz"],
-        help="Transition npz files (default: gp_data/transitions_band3to5.npz)",
+        default=["gp_data/transitions_all_filt4ms_1000_zosc05.npz"],
+        help="Transition npz files (default: gp_data/transitions_all_filt4ms_1000_zosc05.npz)",
     )
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-opt", action="store_true", help="Disable GP hyperparameter optimization")
     parser.add_argument("--no-report", action="store_true", help="Disable training report printout")
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.2,
+        help="Holdout validation ratio in [0,1). 0 disables split (default: 0).",
+    )
+    parser.add_argument(
+        "--val-seed",
+        type=int,
+        default=123,
+        help="Random seed for holdout split when --val-ratio>0 (default: 123).",
+    )
+    parser.add_argument(
+        "--val-temporal-split",
+        action="store_true",
+        help="Use last val-ratio chunk as validation instead of random split.",
+    )
     args = parser.parse_args()
 
     from rtmpc_demo import DoubleIntegrator, LinearIrisHover
@@ -524,14 +543,40 @@ def cli_fit() -> None:
     u_t_all = np.vstack(u_list)
     x_tp1_all = np.vstack(xn_list)
 
+    total_n = x_t_all.shape[0]
+    val_ratio = float(args.val_ratio)
+    if val_ratio < 0.0 or val_ratio >= 1.0:
+        raise ValueError("--val-ratio must satisfy 0 <= val_ratio < 1")
+
+    if val_ratio > 0.0:
+        n_val = max(1, int(round(total_n * val_ratio)))
+        n_val = min(n_val, total_n - 4)
+        if n_val <= 0:
+            raise ValueError("not enough samples for holdout split; reduce --val-ratio")
+
+        if args.val_temporal_split:
+            train_idx = np.arange(0, total_n - n_val, dtype=int)
+            val_idx = np.arange(total_n - n_val, total_n, dtype=int)
+        else:
+            rng = np.random.default_rng(int(args.val_seed))
+            perm = rng.permutation(total_n)
+            val_idx = np.sort(perm[:n_val])
+            train_idx = np.sort(perm[n_val:])
+
+        x_t_train, u_t_train, x_tp1_train = x_t_all[train_idx], u_t_all[train_idx], x_tp1_all[train_idx]
+        x_t_val, u_t_val, x_tp1_val = x_t_all[val_idx], u_t_all[val_idx], x_tp1_all[val_idx]
+    else:
+        x_t_train, u_t_train, x_tp1_train = x_t_all, u_t_all, x_tp1_all
+        x_t_val = u_t_val = x_tp1_val = None
+
     model = VelocityResidualGP.fit_from_transitions(
         dynamics=args.dynamics,
         dt=float(args.dt),
         A=A,
         B=B,
-        x_t=x_t_all,
-        u_t=u_t_all,
-        x_tp1=x_tp1_all,
+        x_t=x_t_train,
+        u_t=u_t_train,
+        x_tp1=x_tp1_train,
         optimize_hyperparams=not args.no_opt,
         max_points_per_axis=int(args.max_points),
         random_seed=int(args.seed),
@@ -540,16 +585,34 @@ def cli_fit() -> None:
     model.save(args.out)
     print(f"[gp] saved model: {args.out}")
     print(f"[gp] samples: {x_t_all.shape[0]}")
+    print(f"[gp] train_samples: {x_t_train.shape[0]}")
+    if x_t_val is not None:
+        print(f"[gp] val_samples: {x_t_val.shape[0]}")
+        print(
+            f"[gp] val_split: ratio={val_ratio:.3f}, mode="
+            f"{'temporal' if args.val_temporal_split else 'random'}, seed={int(args.val_seed)}"
+        )
     print(f"[gp] dynamics={args.dynamics}, dt={args.dt}")
     if not args.no_report:
         _print_training_report(
             model=model,
             A=A,
             B=B,
-            x_t=x_t_all,
-            u_t=u_t_all,
-            x_tp1=x_tp1_all,
+            x_t=x_t_train,
+            u_t=u_t_train,
+            x_tp1=x_tp1_train,
+            tag="train",
         )
+        if x_t_val is not None:
+            _print_training_report(
+                model=model,
+                A=A,
+                B=B,
+                x_t=x_t_val,
+                u_t=u_t_val,
+                x_tp1=x_tp1_val,
+                tag="val",
+            )
 
 
 if __name__ == "__main__":

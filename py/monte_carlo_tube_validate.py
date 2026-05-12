@@ -351,13 +351,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Monte Carlo 检查当前 tube 半径 z_half 是否合理")
     parser.add_argument("--task", choices=["point", "tracking"], default="tracking")
     parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
-    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument(
         "--tracking-profile",
         choices=["paper_baseline", "high_speed_extension"],
-        default="paper_baseline",
+        default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
     parser.add_argument("--disturbance-scale", type=float, default=1.0, help="对当前 w_half 的缩放系数")
@@ -370,15 +370,25 @@ def main() -> None:
     parser.add_argument(
         "--force-bound-mg",
         type=float,
-        default=0.05,
+        default=0.1,
         help="当 disturbance-mode=force_only 时生效：外力上限系数 c，使 ||f_ext||<=c*m*g。",
     )
-    parser.add_argument("--gp-model", type=str, default=None, help="Optional GP residual model (.npz)")
-    parser.add_argument("--gp-beta-sigma", type=float, default=2.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
-        "--gp-shrink-mode",
+        "--gp_model",
+        type=str,
+        default="gp_model/iris_linear_residual_gp.npz",
+        help="Optional GP residual model (.npz)",
+    )
+    parser.add_argument(
+        "--gp_beta_sigma",
+        type=float,
+        default=2.0,
+        help="GP uncertainty envelope multiplier",
+    )
+    parser.add_argument(
+        "--gp_shrink_mode",
         choices=["none", "replace", "min"],
-        default="none",
+        default="replace",
         help="How GP uncertainty bound is merged with disturbance bound for tube sizing.",
     )
     parser.add_argument("--init-pos-jitter", type=float, default=0.05)
