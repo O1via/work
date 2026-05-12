@@ -34,7 +34,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from alg1_dagger import build_mlp, load_policy_checkpoint, make_policy_input, make_reference, policy_forward
-from gp_residual_model import VelocityResidualGP, merge_bounds
+from gp_residual_model import VelocityResidualGP, residual_shrink_bounds
 from rtmpc_demo import (
     DoubleIntegrator,
     LinearIrisHover,
@@ -84,7 +84,7 @@ def build_validation_context(
     force_bound_mg: float,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
-    gp_shrink_mode: str = "none",
+    gp_shrink_mode: str = "residual",
 ) -> Dict[str, np.ndarray]:
     if dynamics == "double_integrator":
         sim = DoubleIntegrator(dt=0.1)
@@ -105,7 +105,8 @@ def build_validation_context(
         force_bound_mg=float(force_bound_mg),
     )
     gp_model = None
-    gp_w_half = None
+    gp_unc_half = np.zeros_like(w_half_target)
+    gp_comp_half = np.zeros_like(w_half_target)
 
     x_min_base, x_max_base = base_state_bounds(dynamics)
     if dynamics == "double_integrator":
@@ -130,20 +131,26 @@ def build_validation_context(
             raise ValueError(
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
-        gp_w_half = gp_model.conservative_uncertainty_bound(
+        gp_unc_half = gp_model.conservative_uncertainty_bound(
             x_min=x_min_base,
             x_max=x_max_base,
             beta_sigma=float(gp_beta_sigma),
         )
+        gp_comp_half = gp_model.conservative_mean_bound(
+            x_min=x_min_base,
+            x_max=x_max_base,
+        )
         print(f"[gp] loaded model: {gp_path}")
-        print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_w_half}")
+        print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_unc_half}")
+        print(f"[gp] compensable mean bound: {gp_comp_half}")
 
-    w_half_target = merge_bounds(
+    w_half_target = residual_shrink_bounds(
         base_w_half=w_half_target,
-        gp_w_half=gp_w_half if gp_w_half is not None else w_half_target,
+        gp_comp_half=gp_comp_half,
+        gp_unc_half=gp_unc_half,
         mode=gp_shrink_mode,
     )
-    print(f"[tube] disturbance bound after GP merge (mode={gp_shrink_mode}): {w_half_target}")
+    print(f"[tube] residual disturbance bound after GP shrink (mode={gp_shrink_mode}): {w_half_target}")
 
     A_cl = A + B @ K
     z_half = compute_rpi_box(A_cl, w_half_target)
@@ -195,6 +202,8 @@ def build_validation_context(
         "tracking_profile": np.array([tracking_profile]),
         "gp_model": gp_model,
         "gp_beta_sigma": np.array([float(gp_beta_sigma)], dtype=float),
+        "gp_unc_half": gp_unc_half,
+        "gp_comp_half": gp_comp_half,
         "disturbance_mode": disturbance_mode,
         "force_bound_mg": np.array([float(force_bound_mg)], dtype=float),
         "dt": np.array([float(sim.dt)], dtype=float),
@@ -600,7 +609,7 @@ def main() -> None:
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force-bound-mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_bound_mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--domain", choices=["source", "target", "both"], default="both")
     parser.add_argument("--episodes", type=int, default=5, help="Number of validation episodes per domain")
     parser.add_argument("--sim-steps", type=int, default=100)
@@ -621,9 +630,9 @@ def main() -> None:
     parser.add_argument("--gp-beta-sigma", type=float, default=2.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
         "--gp-shrink-mode",
-        choices=["none", "replace", "min"],
-        default="none",
-        help="How GP uncertainty bound is merged with disturbance bound for tube sizing.",
+        choices=["none", "residual"],
+        default="residual",
+        help="GP收缩模式：none=不收缩；residual=base-gp_comp+gp_unc 的残差边界。",
     )
     parser.add_argument(
         "--interactive-trajectory",

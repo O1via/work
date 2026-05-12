@@ -21,7 +21,7 @@ import osqp
 import numpy as np
 import scipy.sparse as sp
 from scipy.linalg import solve_discrete_are
-from gp_residual_model import VelocityResidualGP, merge_bounds
+from gp_residual_model import VelocityResidualGP, residual_shrink_bounds
 from rtmpc_constants import (
     sample_process_disturbance,
     base_initial_state,
@@ -552,7 +552,7 @@ def demo(
     force_bound_mg: float = 0.05,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
-    gp_shrink_mode: str = "none",
+    gp_shrink_mode: str = "residual",
     tracking_shape: str = "line",
     tracking_profile: str = "paper_baseline",
     sim_steps: int = 60,
@@ -612,7 +612,8 @@ def demo(
         force_bound_mg=float(force_bound_mg),
     )
     gp_model = None
-    gp_w_half = None
+    gp_unc_half = np.zeros_like(w_half)
+    gp_comp_half = np.zeros_like(w_half)
     if gp_model_path:
         gp_path = Path(gp_model_path)
         if not gp_path.exists():
@@ -630,20 +631,26 @@ def demo(
             raise ValueError(
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
-        gp_w_half = gp_model.conservative_uncertainty_bound(
+        gp_unc_half = gp_model.conservative_uncertainty_bound(
             x_min=x_min_base,
             x_max=x_max_base,
             beta_sigma=float(gp_beta_sigma),
         )
+        gp_comp_half = gp_model.conservative_mean_bound(
+            x_min=x_min_base,
+            x_max=x_max_base,
+        )
         print(f"[gp] loaded model: {gp_path}")
-        print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_w_half}")
+        print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_unc_half}")
+        print(f"[gp] compensable mean bound: {gp_comp_half}")
 
-    w_half = merge_bounds(
+    w_half = residual_shrink_bounds(
         base_w_half=w_half,
-        gp_w_half=gp_w_half if gp_w_half is not None else w_half,
+        gp_comp_half=gp_comp_half,
+        gp_unc_half=gp_unc_half,
         mode=gp_shrink_mode,
     )
-    print(f"[tube] disturbance bound after GP merge (mode={gp_shrink_mode}): {w_half}")
+    print(f"[tube] residual disturbance bound after GP shrink (mode={gp_shrink_mode}): {w_half}")
 
     A_cl = A + B @ K
     z_half = compute_rpi_box(A_cl, w_half)
@@ -934,14 +941,14 @@ if __name__ == "__main__":
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force-bound-mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
-    parser.add_argument("--gp-model", type=str, default=None, help="Optional GP residual model (.npz)")
-    parser.add_argument("--gp-beta-sigma", type=float, default=2.0, help="GP uncertainty envelope multiplier")
+    parser.add_argument("--force_bound_mg", type=float, default=0.1, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--gp-model", type=str, default="gp_model/iris_linear_residual_gp.npz", help="Optional GP residual model (.npz)")
+    parser.add_argument("--gp-beta-sigma", type=float, default=1.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
         "--gp-shrink-mode",
-        choices=["none", "replace", "min"],
-        default="none",
-        help="How GP uncertainty bound is merged with disturbance bound for tube sizing.",
+        choices=["none", "residual"],
+        default="residual",
+        help="GP收缩模式：none=不收缩；residual=base-gp_comp+gp_unc 的残差边界。",
     )
     parser.add_argument("--tracking-shape", choices=["line", "circle"], default="circle")
     parser.add_argument(

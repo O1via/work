@@ -292,7 +292,7 @@ def main() -> None:
     parser.add_argument("--sim-steps", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument("--disturbance-mode", choices=["state_box", "force_only"], default="force_only")
-    parser.add_argument("--force-bound-mg", type=float, default=0.05)
+    parser.add_argument("--force_bound_mg", type=float, default=0.05)
     parser.add_argument("--state-box-scale", type=float, default=1.0)
     parser.add_argument("--qp-state-bounds", choices=["base", "none"], default="base")
     parser.add_argument("--qp-input-bounds", choices=["base", "none"], default="base")

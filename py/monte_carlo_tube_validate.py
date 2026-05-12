@@ -12,7 +12,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from alg1_dagger import make_reference
-from gp_residual_model import VelocityResidualGP, merge_bounds
+from gp_residual_model import VelocityResidualGP, residual_shrink_bounds
 from rtmpc_demo import (
     DoubleIntegrator,
     LinearIrisHover,
@@ -32,6 +32,10 @@ from rtmpc_constants import (
 )
 
 
+def _arr_str(x: np.ndarray) -> str:
+    return np.array2string(np.asarray(x, dtype=float), precision=6, floatmode="fixed", suppress_small=False)
+
+
 def build_context(
     dynamics: str,
     task: str,
@@ -42,7 +46,7 @@ def build_context(
     force_bound_mg: float,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
-    gp_shrink_mode: str = "none",
+    gp_shrink_mode: str = "residual",
 ) -> Dict[str, np.ndarray]:
     if dynamics == "double_integrator":
         sim = DoubleIntegrator(dt=0.1)
@@ -74,6 +78,7 @@ def build_context(
         mode=disturbance_mode,
         force_bound_mg=float(force_bound_mg),
     )
+    w_half_nominal = w_half.copy()
     x_min_base, x_max_base = base_state_bounds(dynamics)
     if dynamics == "double_integrator":
         u_min_base, u_max_base = base_input_bounds(dynamics, m=m)
@@ -81,7 +86,8 @@ def build_context(
         u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
 
     gp_model = None
-    gp_w_half = None
+    gp_unc_half = np.zeros_like(w_half)
+    gp_comp_half = np.zeros_like(w_half)
     if gp_model_path:
         gp_path = Path(gp_model_path)
         if not gp_path.exists():
@@ -99,20 +105,27 @@ def build_context(
             raise ValueError(
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
-        gp_w_half = gp_model.conservative_uncertainty_bound(
+        gp_unc_half = gp_model.conservative_uncertainty_bound(
             x_min=x_min_base,
             x_max=x_max_base,
             beta_sigma=float(gp_beta_sigma),
         )
+        gp_comp_half = gp_model.conservative_mean_bound(
+            x_min=x_min_base,
+            x_max=x_max_base,
+        )
         print(f"[gp] loaded model: {gp_path}")
-        print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_w_half}")
+        print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_unc_half}")
+        print(f"[gp] compensable mean bound: {gp_comp_half}")
 
-    w_half = merge_bounds(
+    w_half = residual_shrink_bounds(
         base_w_half=w_half,
-        gp_w_half=gp_w_half if gp_w_half is not None else w_half,
+        gp_comp_half=gp_comp_half,
+        gp_unc_half=gp_unc_half,
         mode=gp_shrink_mode,
     )
-    print(f"[tube] disturbance bound after GP merge (mode={gp_shrink_mode}): {w_half}")
+    print(f"[tube] base disturbance bound ({disturbance_mode}): {w_half_nominal}")
+    print(f"[tube] residual disturbance bound after GP shrink (mode={gp_shrink_mode}): {w_half}")
     # 注意：state_box 与 force_only 是两套独立扰动定义，不做相减混合。
     w_half_force = w_half_from_force
     A_cl = A + B @ K
@@ -182,7 +195,10 @@ def build_context(
         "w_half": w_half,
         "w_half_base": w_half_base,
         "w_half_force": w_half_force,
+        "gp_unc_half": gp_unc_half,
+        "gp_comp_half": gp_comp_half,
         "z_half": z_half,
+        "u_half": u_half,
         "x_min_base": x_min_base,
         "x_max_base": x_max_base,
         "u_min_base": u_min_base,
@@ -260,12 +276,13 @@ def run_monte_carlo(
     eps = 1e-12
     ptr = 0
 
-    for _ in range(episodes):
+    for ep in range(episodes):
         x = sample_initial_state(ctx["x0"], rng, init_pos_jitter, init_vel_jitter)
 
         for t in range(sim_steps):
             x_des = ctx["x_ref_all"][t : t + horizon + 1]
             d_affine = None
+            d_mean = None
             if gp_model is not None:
                 d_mean, _ = gp_model.predict_state_disturbance(
                     x=x,
@@ -273,20 +290,55 @@ def run_monte_carlo(
                 )
                 d_affine = np.tile(d_mean.reshape(1, -1), (horizon, 1))
 
-            Xbar, Ubar = solve_rtmc_qp_paper(
-                A=A,
-                B=B,
-                Qx=ctx["Qx"],
-                Ru=ctx["Ru"],
-                Px=ctx["Px"],
-                x_meas=x,
-                x_des=x_des,
-                N=horizon,
-                z_half=ctx["z_half"],
-                x_bounds=(ctx["x_min_t"], ctx["x_max_t"]),
-                u_bounds=(ctx["u_min_t"], ctx["u_max_t"]),
-                d_affine=d_affine,
-            )
+            try:
+                Xbar, Ubar = solve_rtmc_qp_paper(
+                    A=A,
+                    B=B,
+                    Qx=ctx["Qx"],
+                    Ru=ctx["Ru"],
+                    Px=ctx["Px"],
+                    x_meas=x,
+                    x_des=x_des,
+                    N=horizon,
+                    z_half=ctx["z_half"],
+                    x_bounds=(ctx["x_min_t"], ctx["x_max_t"]),
+                    u_bounds=(ctx["u_min_t"], ctx["u_max_t"]),
+                    d_affine=d_affine,
+                )
+            except Exception as exc:
+                bx = int(ctx["bottleneck_x_dim"][0])
+                bu = int(ctx["bottleneck_u_dim"][0])
+                x_min_t = np.asarray(ctx["x_min_t"], dtype=float).reshape(-1)
+                x_max_t = np.asarray(ctx["x_max_t"], dtype=float).reshape(-1)
+                u_min_t = np.asarray(ctx["u_min_t"], dtype=float).reshape(-1)
+                u_max_t = np.asarray(ctx["u_max_t"], dtype=float).reshape(-1)
+                gamma_x_per_dim = np.asarray(ctx["gamma_x_per_dim"], dtype=float).reshape(-1)
+                gamma_u_per_dim = np.asarray(ctx["gamma_u_per_dim"], dtype=float).reshape(-1)
+
+                x_ref0 = np.asarray(x_des[0], dtype=float).reshape(-1)
+                x_margin_low = float(x[bx] - x_min_t[bx])
+                x_margin_high = float(x_max_t[bx] - x[bx])
+                x_ref_margin_low = float(x_ref0[bx] - x_min_t[bx])
+                x_ref_margin_high = float(x_max_t[bx] - x_ref0[bx])
+                u_width_b = float(u_max_t[bu] - u_min_t[bu])
+                d_mean_now = np.zeros((n,), dtype=float) if d_mean is None else np.asarray(d_mean, dtype=float).reshape(-1)
+
+                raise RuntimeError(
+                    "QP infeasible during Monte Carlo rollout.\n"
+                    f"  episode={ep}, step={t}, ptr={ptr}\n"
+                    f"  solver_error={exc}\n"
+                    f"  bottleneck_x_dim={bx}, bottleneck_x_gamma={gamma_x_per_dim[bx]:.6f}\n"
+                    f"  bottleneck_u_dim={bu}, bottleneck_u_gamma={gamma_u_per_dim[bu]:.6f}\n"
+                    f"  x[bottleneck]={x[bx]:.6f}, x_ref0[bottleneck]={x_ref0[bx]:.6f}, "
+                    f"x_min_t={x_min_t[bx]:.6f}, x_max_t={x_max_t[bx]:.6f}\n"
+                    f"  x_margin_low={x_margin_low:.6f}, x_margin_high={x_margin_high:.6f}, "
+                    f"x_ref_margin_low={x_ref_margin_low:.6f}, x_ref_margin_high={x_ref_margin_high:.6f}\n"
+                    f"  u_tight_width[bottleneck_u]={u_width_b:.6f}, "
+                    f"u_min_t={u_min_t[bu]:.6f}, u_max_t={u_max_t[bu]:.6f}\n"
+                    f"  x_meas={_arr_str(x)}\n"
+                    f"  x_ref0={_arr_str(x_ref0)}\n"
+                    f"  d_mean_now={_arr_str(d_mean_now)}"
+                ) from exc
 
             xbar0 = Xbar[0]
             ubar0 = Ubar[0]
@@ -357,7 +409,7 @@ def main() -> None:
     parser.add_argument(
         "--tracking-profile",
         choices=["paper_baseline", "high_speed_extension"],
-        default="high_speed_extension",
+        default="paper_baseline",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
     parser.add_argument("--disturbance-scale", type=float, default=1.0, help="对当前 w_half 的缩放系数")
@@ -368,9 +420,9 @@ def main() -> None:
         help="扰动构造方案：state_box=仅用当前8维状态扰动盒；force_only=仅用外力上限映射。",
     )
     parser.add_argument(
-        "--force-bound-mg",
+        "--force_bound_mg",
         type=float,
-        default=0.1,
+        default=0.4,
         help="当 disturbance-mode=force_only 时生效：外力上限系数 c，使 ||f_ext||<=c*m*g。",
     )
     parser.add_argument(
@@ -382,14 +434,14 @@ def main() -> None:
     parser.add_argument(
         "--gp_beta_sigma",
         type=float,
-        default=2.0,
+        default=1.0,
         help="GP uncertainty envelope multiplier",
     )
     parser.add_argument(
         "--gp_shrink_mode",
-        choices=["none", "replace", "min"],
-        default="replace",
-        help="How GP uncertainty bound is merged with disturbance bound for tube sizing.",
+        choices=["none", "residual"],
+        default="residual",
+        help="GP收缩模式：none=不收缩；residual=base-gp_comp+gp_unc 的残差边界。",
     )
     parser.add_argument("--init-pos-jitter", type=float, default=0.05)
     parser.add_argument("--init-vel-jitter", type=float, default=0.05)
@@ -403,7 +455,7 @@ def main() -> None:
     if args.disturbance_scale <= 0.0:
         raise ValueError("disturbance-scale 必须 > 0")
     if args.force_bound_mg < 0.0:
-        raise ValueError("force-bound-mg 必须 >= 0")
+        raise ValueError("force_bound_mg 必须 >= 0")
     if not (0.0 < args.quantile < 1.0):
         raise ValueError("quantile 必须在 (0,1) 内")
 
@@ -456,7 +508,15 @@ def main() -> None:
             "bottleneck_u_dim": int(ctx["bottleneck_u_dim"][0]),
             "w_half_base": ctx["w_half_base"].tolist(),
             "w_half_force": ctx["w_half_force"].tolist(),
+            "gp_comp_half": ctx["gp_comp_half"].tolist(),
+            "gp_unc_half": ctx["gp_unc_half"].tolist(),
             "used_w_half": result["used_w_half"].tolist(),
+            "u_half_per_dim": ctx["u_half"].tolist(),
+            "u_min_base": ctx["u_min_base"].tolist(),
+            "u_max_base": ctx["u_max_base"].tolist(),
+            "u_min_t": ctx["u_min_t"].tolist(),
+            "u_max_t": ctx["u_max_t"].tolist(),
+            "u_tight_width_per_dim": (ctx["u_max_t"] - ctx["u_min_t"]).tolist(),
         }
     )
 

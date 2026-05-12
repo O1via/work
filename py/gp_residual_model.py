@@ -311,7 +311,7 @@ class VelocityResidualGP:
         x_min: np.ndarray,
         x_max: np.ndarray,
         beta_sigma: float = 2.0,
-        grid_points_per_dim: int = 3,
+        grid_points_per_dim: int = 9,
     ) -> np.ndarray:
         x_min = np.asarray(x_min, dtype=float).reshape(-1)
         x_max = np.asarray(x_max, dtype=float).reshape(-1)
@@ -357,6 +357,57 @@ class VelocityResidualGP:
             out[v] = dt * b * std_max[j]
         return out
 
+    def conservative_mean_bound(
+        self,
+        x_min: np.ndarray,
+        x_max: np.ndarray,
+        grid_points_per_dim: int = 9,
+    ) -> np.ndarray:
+        """保守评估 |d_mean(x)| 的逐维上界（状态扰动空间）。
+
+        用于“总扰动边界 - 可补偿均值边界 + GP不确定性边界”的残差管构造。
+        返回向量含义与 `predict_state_disturbance` 中 d_mean 的状态维一致。
+        """
+        x_min = np.asarray(x_min, dtype=float).reshape(-1)
+        x_max = np.asarray(x_max, dtype=float).reshape(-1)
+        if x_min.size != self.state_dim or x_max.size != self.state_dim:
+            raise ValueError("x_min/x_max dimension mismatch")
+        if np.any(x_max <= x_min):
+            raise ValueError("invalid state bounds: require x_max > x_min")
+
+        k = len(self.vel_idx)
+        if grid_points_per_dim < 2:
+            grid_points_per_dim = 2
+
+        axiswise = all(int(gp.x_mean.size) == 1 for gp in self.axis_models)
+        if axiswise:
+            mean_abs_max = np.zeros((k,), dtype=float)
+            for j, idx in enumerate(self.vel_idx):
+                lo = float(x_min[idx])
+                hi = float(x_max[idx])
+                vals = np.linspace(lo, hi, grid_points_per_dim).reshape(-1, 1)
+                mu, _ = self.axis_models[j].predict(vals)
+                mean_abs_max[j] = float(np.max(np.abs(mu)))
+        else:
+            axis_vals = []
+            for idx in self.vel_idx:
+                lo = float(x_min[idx])
+                hi = float(x_max[idx])
+                axis_vals.append(np.linspace(lo, hi, grid_points_per_dim))
+            points = np.array(list(itertools.product(*axis_vals)), dtype=float).reshape(-1, k)
+            mean_acc, _ = self.predict_accel(points)
+            mean_abs_max = np.max(np.abs(mean_acc), axis=0)
+
+        out = np.zeros((self.state_dim,), dtype=float)
+        dt = float(self.dt)
+        dt2 = 0.5 * dt * dt
+        for j in range(k):
+            p = int(self.pos_idx[j])
+            v = int(self.vel_idx[j])
+            out[p] = dt2 * mean_abs_max[j]
+            out[v] = dt * mean_abs_max[j]
+        return out
+
     def save(self, path: str) -> None:
         payload: Dict[str, np.ndarray] = {
             "dynamics": np.array([self.dynamics]),
@@ -379,19 +430,35 @@ class VelocityResidualGP:
         models = [RbfGp1D.load(prefix=f"axis{i}", src=payload) for i in range(axis_count)]
         return cls(dynamics=dynamics, dt=dt, state_dim=state_dim, axis_models=models)
 
+def residual_shrink_bounds(
+    base_w_half: np.ndarray,
+    gp_comp_half: np.ndarray,
+    gp_unc_half: np.ndarray,
+    mode: str,
+) -> np.ndarray:
+    """将 GP 补偿统一映射为“残差扰动边界”。
 
-def merge_bounds(base_w_half: np.ndarray, gp_w_half: np.ndarray, mode: str) -> np.ndarray:
+    设总扰动边界为 base_w_half，GP 估计补偿项均值界为 gp_comp_half，
+    GP 未建模/预测不确定性界为 gp_unc_half。
+
+    - mode='none': 不做 GP 收缩，直接用 base_w_half
+    - mode='residual': 用启发式残差界
+        w_res = max(base_w_half - gp_comp_half, 0) + gp_unc_half
+
+    该构造体现：
+    1) 可补偿的速度相关部分会收缩扰动管；
+    2) 不确定性与随机残差仍保留在最终鲁棒管中。
+    """
     base_w_half = np.asarray(base_w_half, dtype=float).reshape(-1)
-    gp_w_half = np.asarray(gp_w_half, dtype=float).reshape(-1)
-    if base_w_half.size != gp_w_half.size:
+    gp_comp_half = np.asarray(gp_comp_half, dtype=float).reshape(-1)
+    gp_unc_half = np.asarray(gp_unc_half, dtype=float).reshape(-1)
+    if not (base_w_half.size == gp_comp_half.size == gp_unc_half.size):
         raise ValueError("bound dimensions mismatch")
     if mode == "none":
         return base_w_half
-    if mode == "replace":
-        return gp_w_half
-    if mode == "min":
-        return np.minimum(base_w_half, gp_w_half)
-    raise ValueError("gp shrink mode must be one of: none|replace|min")
+    if mode == "residual":
+        return np.maximum(base_w_half - gp_comp_half, 0.0) + gp_unc_half
+    raise ValueError("gp shrink mode must be one of: none|residual")
 
 
 def _load_transition_npz(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
