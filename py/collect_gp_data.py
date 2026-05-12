@@ -184,6 +184,7 @@ def rollout_collect_episode(
     horizon: int,
     disturbance_mode: str,
     force_bound_mg: float,
+    force_d_axis_scale: float,
     rng: np.random.Generator,
     w_half: np.ndarray,
     x_bounds_for_qp: Optional[Tuple[np.ndarray, np.ndarray]],
@@ -251,6 +252,7 @@ def rollout_collect_episode(
             dt=float(sim.dt),
             mode=disturbance_mode,
             force_bound_mg=float(force_bound_mg),
+            force_d_axis_scale=float(force_d_axis_scale),
             state_dim=n,
             w_half=w_half,
         )
@@ -293,6 +295,7 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument("--disturbance-mode", choices=["state_box", "force_only"], default="force_only")
     parser.add_argument("--force_bound_mg", type=float, default=0.05)
+    parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--state-box-scale", type=float, default=1.0)
     parser.add_argument("--qp-state-bounds", choices=["base", "none"], default="base")
     parser.add_argument("--qp-input-bounds", choices=["base", "none"], default="base")
@@ -323,6 +326,8 @@ def main() -> None:
         raise ValueError("horizon 必须为正")
     if args.state_box_scale <= 0.0:
         raise ValueError("state_box_scale 必须为正")
+    if not (0.0 <= args.force_d_axis_scale <= 1.0):
+        raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
     if args.tube_eps <= 0.0:
         raise ValueError("tube_eps 必须为正")
 
@@ -350,6 +355,7 @@ def main() -> None:
         dt=float(sim.dt),
         mode=args.disturbance_mode,
         force_bound_mg=float(args.force_bound_mg),
+        force_d_axis_scale=float(args.force_d_axis_scale),
     )
     if args.disturbance_mode == "state_box":
         w_half = np.asarray(w_half, dtype=float) * float(args.state_box_scale)
@@ -413,6 +419,7 @@ def main() -> None:
             horizon=int(args.horizon),
             disturbance_mode=args.disturbance_mode,
             force_bound_mg=float(args.force_bound_mg),
+            force_d_axis_scale=float(args.force_d_axis_scale),
             rng=rng,
             w_half=w_half,
             x_bounds_for_qp=x_bounds_for_qp,
@@ -484,6 +491,7 @@ def main() -> None:
         tracking_profile=np.array([args.tracking_profile]),
         disturbance_mode=np.array([args.disturbance_mode]),
         force_bound_mg=np.array([float(args.force_bound_mg)], dtype=float),
+        force_d_axis_scale=np.array([float(args.force_d_axis_scale)], dtype=float),
         dt=np.array([float(sim.dt)], dtype=float),
         horizon=np.array([int(args.horizon)], dtype=int),
         sim_steps=np.array([int(args.sim_steps)], dtype=int),

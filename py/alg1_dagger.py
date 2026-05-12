@@ -328,6 +328,7 @@ def main() -> None:
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
     parser.add_argument("--force_bound_mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--cycles", type=int, default=8, help="Number of Algorithm 1 iterations")
     parser.add_argument("--sim-steps", type=int, default=100, help="Receding-horizon steps per cycle")
     parser.add_argument(
@@ -375,6 +376,8 @@ def main() -> None:
         help="训练日志文件名（保存在 --out-dir 下）。",
     )
     args = parser.parse_args()
+    if not (0.0 <= args.force_d_axis_scale <= 1.0):
+        raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
 
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, args.log_file)
@@ -409,6 +412,7 @@ def main() -> None:
         dt=float(sim.dt),
         mode=args.disturbance_mode,
         force_bound_mg=float(args.force_bound_mg),
+        force_d_axis_scale=float(args.force_d_axis_scale),
     )
     gp_model = None
     gp_unc_half = np.zeros_like(w_half)

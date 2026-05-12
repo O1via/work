@@ -550,6 +550,7 @@ def demo(
     dynamics: str = "iris_linear",
     disturbance_mode: str = "force_only",
     force_bound_mg: float = 0.05,
+    force_d_axis_scale: float = 0.15,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
     gp_shrink_mode: str = "residual",
@@ -610,6 +611,7 @@ def demo(
         dt=float(sim.dt),
         mode=disturbance_mode,
         force_bound_mg=float(force_bound_mg),
+        force_d_axis_scale=float(force_d_axis_scale),
     )
     gp_model = None
     gp_unc_half = np.zeros_like(w_half)
@@ -856,6 +858,7 @@ def demo(
             dt=float(sim.dt),
             mode=disturbance_mode,
             force_bound_mg=float(force_bound_mg),
+            force_d_axis_scale=float(force_d_axis_scale),
             state_dim=n,
             w_half=w_half,
         )
@@ -942,6 +945,7 @@ if __name__ == "__main__":
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
     parser.add_argument("--force_bound_mg", type=float, default=0.1, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--gp-model", type=str, default="gp_model/iris_linear_residual_gp.npz", help="Optional GP residual model (.npz)")
     parser.add_argument("--gp-beta-sigma", type=float, default=1.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
@@ -973,6 +977,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--plot", type=str, default=None, help="Optional path to save a PNG plot")
     args = parser.parse_args()
+    if not (0.0 <= args.force_d_axis_scale <= 1.0):
+        raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
 
     # VS Code Run Code 通常不带任何命令行参数：给一个可复现实验结果的默认输出。
     if args.plot is None and len(sys.argv) == 1:
@@ -984,6 +990,7 @@ if __name__ == "__main__":
         dynamics=args.dynamics,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
+        force_d_axis_scale=args.force_d_axis_scale,
         gp_model_path=args.gp_model,
         gp_beta_sigma=float(args.gp_beta_sigma),
         gp_shrink_mode=args.gp_shrink_mode,

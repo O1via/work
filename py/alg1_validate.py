@@ -82,6 +82,7 @@ def build_validation_context(
     dynamics: str,
     disturbance_mode: str,
     force_bound_mg: float,
+    force_d_axis_scale: float,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
     gp_shrink_mode: str = "residual",
@@ -103,6 +104,7 @@ def build_validation_context(
         dt=float(sim.dt),
         mode=disturbance_mode,
         force_bound_mg=float(force_bound_mg),
+        force_d_axis_scale=float(force_d_axis_scale),
     )
     gp_model = None
     gp_unc_half = np.zeros_like(w_half_target)
@@ -206,6 +208,7 @@ def build_validation_context(
         "gp_comp_half": gp_comp_half,
         "disturbance_mode": disturbance_mode,
         "force_bound_mg": np.array([float(force_bound_mg)], dtype=float),
+        "force_d_axis_scale": np.array([float(force_d_axis_scale)], dtype=float),
         "dt": np.array([float(sim.dt)], dtype=float),
     }
 
@@ -610,6 +613,7 @@ def main() -> None:
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
     parser.add_argument("--force_bound_mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--domain", choices=["source", "target", "both"], default="both")
     parser.add_argument("--episodes", type=int, default=5, help="Number of validation episodes per domain")
     parser.add_argument("--sim-steps", type=int, default=100)
@@ -640,6 +644,8 @@ def main() -> None:
         help="Show interactive trajectory figure window (3D view can be rotated with mouse).",
     )
     args = parser.parse_args()
+    if not (0.0 <= args.force_d_axis_scale <= 1.0):
+        raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
 
     # VS Code 的 Run Code 常不带参数；此时默认开启交互轨迹窗口，便于直接旋转视角。
     if len(sys.argv) == 1 and not args.interactive_trajectory:
@@ -665,6 +671,7 @@ def main() -> None:
         dynamics=args.dynamics,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
+        force_d_axis_scale=args.force_d_axis_scale,
         gp_model_path=args.gp_model,
         gp_beta_sigma=float(args.gp_beta_sigma),
         gp_shrink_mode=args.gp_shrink_mode,
@@ -750,6 +757,7 @@ def main() -> None:
                         dt=float(ctx["dt"][0]),
                         mode=str(ctx["disturbance_mode"]),
                         force_bound_mg=float(ctx["force_bound_mg"][0]),
+                        force_d_axis_scale=float(ctx["force_d_axis_scale"][0]),
                         state_dim=int(ctx["n"][0]),
                         w_half=ctx["w_half_target"],
                     )

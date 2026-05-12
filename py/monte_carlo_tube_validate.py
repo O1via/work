@@ -44,6 +44,7 @@ def build_context(
     tracking_profile: str,
     disturbance_mode: str,
     force_bound_mg: float,
+    force_d_axis_scale: float,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
     gp_shrink_mode: str = "residual",
@@ -65,18 +66,21 @@ def build_context(
         dt=float(sim.dt),
         mode="state_box",
         force_bound_mg=float(force_bound_mg),
+        force_d_axis_scale=float(force_d_axis_scale),
     )
     w_half_from_force = disturbance_half_bounds(
         dynamics,
         dt=float(sim.dt),
         mode="force_only",
         force_bound_mg=float(force_bound_mg),
+        force_d_axis_scale=float(force_d_axis_scale),
     )
     w_half = disturbance_half_bounds(
         dynamics,
         dt=float(sim.dt),
         mode=disturbance_mode,
         force_bound_mg=float(force_bound_mg),
+        force_d_axis_scale=float(force_d_axis_scale),
     )
     w_half_nominal = w_half.copy()
     x_min_base, x_max_base = base_state_bounds(dynamics)
@@ -218,6 +222,7 @@ def build_context(
         "dynamics": dynamics,
         "disturbance_mode": disturbance_mode,
         "force_bound_mg": np.array([float(force_bound_mg)]),
+        "force_d_axis_scale": np.array([float(force_d_axis_scale)]),
         "dt": np.array([float(sim.dt)]),
         "tracking_profile": np.array([tracking_profile]),
         "gp_model": gp_model,
@@ -252,6 +257,7 @@ def run_monte_carlo(
     init_pos_jitter: float,
     init_vel_jitter: float,
     seed: int,
+    violation_ratio_tol: float,
 ) -> Dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
 
@@ -265,6 +271,7 @@ def run_monte_carlo(
     disturbance_mode = str(ctx.get("disturbance_mode", "state_box"))
     dt = float(ctx.get("dt", np.array([0.1]))[0])
     force_bound_mg = float(ctx.get("force_bound_mg", np.array([0.05]))[0])
+    force_d_axis_scale = float(ctx.get("force_d_axis_scale", np.array([0.15]))[0])
     gp_model = ctx.get("gp_model", None)
     gp_beta_sigma = float(ctx.get("gp_beta_sigma", np.array([2.0]))[0])
 
@@ -353,6 +360,7 @@ def run_monte_carlo(
                 dt=dt,
                 mode=disturbance_mode,
                 force_bound_mg=force_bound_mg_eff,
+                force_d_axis_scale=force_d_axis_scale,
                 state_dim=n,
                 w_half=w_half,
             )
@@ -365,7 +373,7 @@ def run_monte_carlo(
             denom = np.maximum(z_half, eps)
             r0 = np.abs(e0) / denom
             ratio_now[ptr] = r0
-            violations_now[ptr] = int(np.any(np.abs(e0) > z_half + 1e-12))
+            violations_now[ptr] = int(np.any(r0 > 1.0 + float(violation_ratio_tol)))
 
             x = x_next
             ptr += 1
@@ -378,7 +386,12 @@ def run_monte_carlo(
     }
 
 
-def summarize(result: Dict[str, np.ndarray], z_half: np.ndarray, quantile_level: float) -> Dict[str, object]:
+def summarize(
+    result: Dict[str, np.ndarray],
+    z_half: np.ndarray,
+    quantile_level: float,
+    violation_ratio_tol: float,
+) -> Dict[str, object]:
     ratio_now = result["ratio_now"]
     e_now = np.abs(result["e_now"])
 
@@ -394,7 +407,8 @@ def summarize(result: Dict[str, np.ndarray], z_half: np.ndarray, quantile_level:
         "z_half_per_dim": z_half.tolist(),
         "q_z_scale_suggestion_per_dim": (q_e_now / np.maximum(z_half, 1e-12)).tolist(),
         # 主判据：在线每步（相对当前步中心 xbar_{0|t}）是否在 tube 内
-        "is_reasonable_at_q": bool(np.max(q_ratio_now) <= 1.0),
+        "is_reasonable_at_q": bool(np.max(q_ratio_now) <= 1.0 + float(violation_ratio_tol)),
+        "violation_ratio_tol": float(violation_ratio_tol),
     }
     return summary
 
@@ -422,8 +436,14 @@ def main() -> None:
     parser.add_argument(
         "--force_bound_mg",
         type=float,
-        default=0.4,
+        default=0.5,
         help="当 disturbance-mode=force_only 时生效：外力上限系数 c，使 ||f_ext||<=c*m*g。",
+    )
+    parser.add_argument(
+        "--force_d_axis_scale",
+        type=float,
+        default=0.15,
+        help="force_only 模式下 d 轴扰动限幅比例（相对 c*g），建议 0~1。",
     )
     parser.add_argument(
         "--gp_model",
@@ -446,6 +466,12 @@ def main() -> None:
     parser.add_argument("--init-pos-jitter", type=float, default=0.05)
     parser.add_argument("--init-vel-jitter", type=float, default=0.05)
     parser.add_argument("--quantile", type=float, default=0.99)
+    parser.add_argument(
+        "--violation_ratio_tol",
+        type=float,
+        default=1e-6,
+        help="越界判定相对容差：r0 > 1 + tol 才记为 violation。",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="montcarlo_runs")
     args = parser.parse_args()
@@ -456,8 +482,12 @@ def main() -> None:
         raise ValueError("disturbance-scale 必须 > 0")
     if args.force_bound_mg < 0.0:
         raise ValueError("force_bound_mg 必须 >= 0")
+    if not (0.0 <= args.force_d_axis_scale <= 1.0):
+        raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
     if not (0.0 < args.quantile < 1.0):
         raise ValueError("quantile 必须在 (0,1) 内")
+    if args.violation_ratio_tol < 0.0:
+        raise ValueError("violation_ratio_tol 必须 >= 0")
 
     ctx = build_context(
         args.dynamics,
@@ -467,6 +497,7 @@ def main() -> None:
         tracking_profile=args.tracking_profile,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
+        force_d_axis_scale=args.force_d_axis_scale,
         gp_model_path=args.gp_model,
         gp_beta_sigma=float(args.gp_beta_sigma),
         gp_shrink_mode=args.gp_shrink_mode,
@@ -481,9 +512,15 @@ def main() -> None:
         init_pos_jitter=args.init_pos_jitter,
         init_vel_jitter=args.init_vel_jitter,
         seed=args.seed,
+        violation_ratio_tol=float(args.violation_ratio_tol),
     )
 
-    summary = summarize(result, z_half=ctx["z_half"], quantile_level=args.quantile)
+    summary = summarize(
+        result,
+        z_half=ctx["z_half"],
+        quantile_level=args.quantile,
+        violation_ratio_tol=float(args.violation_ratio_tol),
+    )
     summary.update(
         {
             "task": args.task,
@@ -495,10 +532,12 @@ def main() -> None:
             "disturbance_scale": float(args.disturbance_scale),
             "disturbance_mode": args.disturbance_mode,
             "force_bound_mg": float(args.force_bound_mg),
+            "force_d_axis_scale": float(args.force_d_axis_scale),
             "gp_model": args.gp_model,
             "gp_beta_sigma": float(args.gp_beta_sigma),
             "gp_shrink_mode": args.gp_shrink_mode,
             "quantile": float(args.quantile),
+            "violation_ratio_tol": float(args.violation_ratio_tol),
             "seed": int(args.seed),
             "gamma_x": float(ctx["gamma_x"][0]),
             "gamma_u": float(ctx["gamma_u"][0]),

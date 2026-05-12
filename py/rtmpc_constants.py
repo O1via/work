@@ -42,7 +42,12 @@ def _base_disturbance_half_bounds(dynamics: str) -> np.ndarray:
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 
 
-def force_bound_to_state_w_half(dynamics: str, dt: float, force_bound_mg: float) -> np.ndarray:
+def force_bound_to_state_w_half(
+    dynamics: str,
+    dt: float,
+    force_bound_mg: float,
+    force_d_axis_scale: float = 0.15,
+) -> np.ndarray:
     """将外力球约束 ||f_ext||<=c*m*g 映射为离散状态扰动盒半宽。
 
     说明：论文形式是球约束（L2）。为兼容当前基于盒集的 RTMPC 实现，这里采用
@@ -51,11 +56,17 @@ def force_bound_to_state_w_half(dynamics: str, dt: float, force_bound_mg: float)
     """
     if force_bound_mg < 0.0:
         raise ValueError("force_bound_mg 必须 >= 0")
+    if force_d_axis_scale < 0.0:
+        raise ValueError("force_d_axis_scale 必须 >= 0")
 
     amax = float(force_bound_mg) * 9.80665
     a_axis = amax / np.sqrt(3.0)
+    d_scale = float(min(force_d_axis_scale, 1.0))
+    a_axis_d = a_axis * d_scale
     pos_half = 0.5 * float(dt) * float(dt) * a_axis
     vel_half = float(dt) * a_axis
+    pos_half_d = 0.5 * float(dt) * float(dt) * a_axis_d
+    vel_half_d = float(dt) * a_axis_d
 
     if dynamics == "double_integrator":
         # x=[px,py,vx,vy]
@@ -64,7 +75,10 @@ def force_bound_to_state_w_half(dynamics: str, dt: float, force_bound_mg: float)
     if dynamics == "iris_linear":
         # x=[pn,pe,vn,ve,pd,vd,phi,theta]
         # 外力扰动主导平动维，姿态维默认由基准盒覆盖。
-        return np.array([pos_half, pos_half, vel_half, vel_half, pos_half, vel_half, 0.0, 0.0], dtype=float)
+        return np.array(
+            [pos_half, pos_half, vel_half, vel_half, pos_half_d, vel_half_d, 0.0, 0.0],
+            dtype=float,
+        )
 
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 
@@ -74,6 +88,7 @@ def disturbance_half_bounds(
     dt: float = 0.1,
     mode: str = "state_box",
     force_bound_mg: float = 0.05,
+    force_d_axis_scale: float = 0.15,
 ) -> np.ndarray:
     """返回扰动盒半宽 w_half。
 
@@ -85,11 +100,20 @@ def disturbance_half_bounds(
     if mode == "state_box":
         return w_half_base
     if mode == "force_only":
-        return force_bound_to_state_w_half(dynamics, dt=dt, force_bound_mg=force_bound_mg)
+        return force_bound_to_state_w_half(
+            dynamics,
+            dt=dt,
+            force_bound_mg=force_bound_mg,
+            force_d_axis_scale=force_d_axis_scale,
+        )
     raise ValueError("mode 应为 'state_box' 或 'force_only'")
 
 
-def sample_force_mapped_acceleration(rng: np.random.Generator, force_bound_mg: float) -> np.ndarray:
+def sample_force_mapped_acceleration(
+    rng: np.random.Generator,
+    force_bound_mg: float,
+    force_d_axis_scale: float = 0.15,
+) -> np.ndarray:
     """按论文常见设置采样外力映射加速度（NED 三轴）。
 
     采样方式：
@@ -99,11 +123,13 @@ def sample_force_mapped_acceleration(rng: np.random.Generator, force_bound_mg: f
     """
     if force_bound_mg < 0.0:
         raise ValueError("force_bound_mg 必须 >= 0")
+    if force_d_axis_scale < 0.0:
+        raise ValueError("force_d_axis_scale 必须 >= 0")
     amax = float(force_bound_mg) * 9.80665
     a_mag = rng.uniform(0.0, amax)
     theta = rng.uniform(0.0, np.pi)
     phi = rng.uniform(0.0, 2.0 * np.pi)
-    return np.array(
+    a = np.array(
         [
             a_mag * np.cos(phi) * np.sin(theta),
             a_mag * np.sin(phi) * np.sin(theta),
@@ -111,6 +137,10 @@ def sample_force_mapped_acceleration(rng: np.random.Generator, force_bound_mg: f
         ],
         dtype=float,
     )
+    # 额外限制 d 轴扰动幅值，保持总加速度范数不超过 amax。
+    d_cap = float(min(force_d_axis_scale, 1.0)) * amax
+    a[2] = float(np.clip(a[2], -d_cap, d_cap))
+    return a
 
 
 def accel_to_state_disturbance(
@@ -157,6 +187,7 @@ def sample_process_disturbance(
     dt: float,
     mode: str,
     force_bound_mg: float,
+    force_d_axis_scale: float,
     state_dim: int,
     w_half: np.ndarray = None,
 ) -> np.ndarray:
@@ -172,7 +203,11 @@ def sample_process_disturbance(
             raise ValueError("w_half 维度与 state_dim 不一致")
         return rng.uniform(-w_half, w_half)
     if mode == "force_only":
-        a = sample_force_mapped_acceleration(rng, force_bound_mg=force_bound_mg)
+        a = sample_force_mapped_acceleration(
+            rng,
+            force_bound_mg=force_bound_mg,
+            force_d_axis_scale=force_d_axis_scale,
+        )
         return accel_to_state_disturbance(
             dynamics=dynamics,
             dt=dt,
