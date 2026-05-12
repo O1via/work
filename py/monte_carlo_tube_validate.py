@@ -423,7 +423,7 @@ def main() -> None:
     parser.add_argument(
         "--tracking-profile",
         choices=["paper_baseline", "high_speed_extension"],
-        default="paper_baseline",
+        default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
     parser.add_argument("--disturbance-scale", type=float, default=1.0, help="对当前 w_half 的缩放系数")
