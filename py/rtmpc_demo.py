@@ -545,11 +545,102 @@ def solve_rtmc_qp_paper(
     return X, U
 
 
+def solve_rtmc_qp_with_gp_stagewise(
+    A: np.ndarray,
+    B: np.ndarray,
+    Qx: np.ndarray,
+    Ru: np.ndarray,
+    Px: np.ndarray,
+    x_meas: np.ndarray,
+    x_des: np.ndarray,
+    N: int,
+    z_half: np.ndarray,
+    x_bounds: Tuple[np.ndarray, np.ndarray],
+    u_bounds: Tuple[np.ndarray, np.ndarray],
+    gp_model: Optional[VelocityResidualGP] = None,
+    gp_beta_sigma: float = 2.0,
+    stagewise_refine_steps: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """QP + GP 均值注入（逐步更新版本）。
+
+    过程：
+    1) 先在不注入 d_affine 的条件下求一次名义 QP（基线预测轨迹）；
+    2) 用该预测中心轨迹 Xbar[i] 逐步重算 d_i=d_mean(Xbar[i])；
+    3) 带阶段相关 d_affine 再求解 QP（可配置迭代次数，默认 1 次）。
+    """
+    if gp_model is None:
+        Xbar, Ubar = solve_rtmc_qp_paper(
+            A=A,
+            B=B,
+            Qx=Qx,
+            Ru=Ru,
+            Px=Px,
+            x_meas=x_meas,
+            x_des=x_des,
+            N=N,
+            z_half=z_half,
+            x_bounds=x_bounds,
+            u_bounds=u_bounds,
+            d_affine=None,
+        )
+        return Xbar, Ubar, None, None
+
+    # 第 1 步：不注入 d_affine，先求一条“中性”预测轨迹。
+    Xbar, Ubar = solve_rtmc_qp_paper(
+        A=A,
+        B=B,
+        Qx=Qx,
+        Ru=Ru,
+        Px=Px,
+        x_meas=x_meas,
+        x_des=x_des,
+        N=N,
+        z_half=z_half,
+        x_bounds=x_bounds,
+        u_bounds=u_bounds,
+        d_affine=None,
+    )
+
+    # 第 2 步起：基于预测轨迹逐步更新 d_affine，并重复求解。
+    d_affine = None
+    prev_d_affine = None
+    for _ in range(max(1, int(stagewise_refine_steps))):
+        d_rows = []
+        for i in range(N):
+            di, _ = gp_model.predict_state_disturbance(
+                x=Xbar[i],
+                beta_sigma=float(gp_beta_sigma),
+            )
+            d_rows.append(np.asarray(di, dtype=float).reshape(-1))
+        d_affine_new = np.vstack(d_rows)
+        d_affine = d_affine_new
+        Xbar, Ubar = solve_rtmc_qp_paper(
+            A=A,
+            B=B,
+            Qx=Qx,
+            Ru=Ru,
+            Px=Px,
+            x_meas=x_meas,
+            x_des=x_des,
+            N=N,
+            z_half=z_half,
+            x_bounds=x_bounds,
+            u_bounds=u_bounds,
+            d_affine=d_affine,
+        )
+        if prev_d_affine is not None and np.allclose(d_affine, prev_d_affine, rtol=1e-3, atol=1e-6):
+            break
+        prev_d_affine = d_affine.copy()
+
+    d0 = None if d_affine is None else np.asarray(d_affine[0], dtype=float).reshape(-1)
+    return Xbar, Ubar, d_affine, d0
+
+
 def demo(
     task: str = "tracking",
     dynamics: str = "iris_linear",
     disturbance_mode: str = "force_only",
-    force_bound_mg: float = 0.05,
+    force_bound_mg: float = 0.5,
     force_d_axis_scale: float = 0.15,
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
@@ -796,29 +887,25 @@ def demo(
             x_des = x_ref_all[t : t + N + 1]
         else:
             x_des = x_ref_all
-        d_affine = None
-        if gp_model is not None:
-            d_mean, _ = gp_model.predict_state_disturbance(
-                x=x,
-                beta_sigma=float(gp_beta_sigma),
-            )
-            d_affine = np.tile(d_mean.reshape(1, -1), (N, 1))
-
-        # 论文 Eq.(10)：名义轨迹 (X̄,Ū) 的滚动优化（严格贴近论文形式）。
-        # 注意：QP 显式包含 tube 初值约束，因此需要“测得的真实状态”x_t 作为输入。
-        Xbar, Ubar = solve_rtmc_qp_paper(
-            A,
-            B,
-            Qx,
-            Ru,
-            Px,
+        # 论文 Eq.(10)：名义轨迹 (X̄,Ū) 的滚动优化。
+        # GP 均值注入采用“逐步更新”：
+        # - 先用 x_t 常值平铺求解一次；
+        # - 再基于预测轨迹 Xbar[i] 逐点重算 d_affine 并再解一次。
+        Xbar, Ubar, _, _ = solve_rtmc_qp_with_gp_stagewise(
+            A=A,
+            B=B,
+            Qx=Qx,
+            Ru=Ru,
+            Px=Px,
             x_meas=x,
             x_des=x_des,
             N=N,
             z_half=z_half,
             x_bounds=(x_min_t, x_max_t),
             u_bounds=(u_min_t, u_max_t),
-            d_affine=d_affine,
+            gp_model=gp_model,
+            gp_beta_sigma=float(gp_beta_sigma),
+            stagewise_refine_steps=1,
         )
 
         # 对齐论文 Algorithm 1：仅围绕“当前时刻”的管中心 x̄_t^*=x̄_{0|t}^* 采样，
@@ -962,8 +1049,8 @@ if __name__ == "__main__":
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
     parser.add_argument("--sim-steps", type=int, default=100)
-    parser.add_argument("--circle-radius", type=float, default=4.0)
-    parser.add_argument("--circle-period-steps", type=int, default=63)
+    parser.add_argument("--circle-radius", type=float, default=5.0)
+    parser.add_argument("--circle-period-steps", type=int, default=79)
     parser.add_argument(
         "--augment-mode",
         choices=["dense", "sparse"],

@@ -14,7 +14,7 @@ def state_cost_matrix(dynamics: str) -> np.ndarray:
         return np.diag([50.0, 50.0, 4.0, 4.0])
     if dynamics == "iris_linear":
         # x=[pn,pe,vn,ve,pd,vd,phi,theta] (NED)
-        return np.diag([40.0, 40.0, 4.0, 4.0, 50.0, 6.0, 3.0, 3.0])
+        return np.diag([50.0, 50.0, 6.0, 6.0, 50.0, 6.0, 3.0, 3.0])
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 
 
@@ -25,10 +25,10 @@ def input_cost_matrix(dynamics: str, m: int) -> np.ndarray:
     if dynamics == "double_integrator":
         return np.eye(m) * 0.01
     if dynamics == "iris_linear":
-        # u=[dT, phi_cmd, theta_cmd]，提高姿态通道惩罚以降低 |K| 与输入收紧量。
+        # u=[dT, phi_cmd, theta_cmd]，适度放宽姿态通道惩罚以增强跟踪能力。
         if m != 3:
             return np.eye(m) * 0.01
-        return np.diag([0.01, 0.6, 0.6])
+        return np.diag([0.01, 0.5, 0.5])
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 
 

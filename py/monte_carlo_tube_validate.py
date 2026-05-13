@@ -18,7 +18,7 @@ from rtmpc_demo import (
     LinearIrisHover,
     compute_infinite_lqr,
     compute_rpi_box,
-    solve_rtmc_qp_paper,
+    solve_rtmc_qp_with_gp_stagewise,
     tighten_box_bounds_with_auto_scale,
 )
 from rtmpc_constants import (
@@ -279,6 +279,10 @@ def run_monte_carlo(
     e_now = np.zeros((total_steps, n), dtype=float)
     ratio_now = np.zeros((total_steps, n), dtype=float)
     violations_now = np.zeros((total_steps,), dtype=np.int32)
+    center_now = np.zeros((episodes, sim_steps, n), dtype=float)
+    ref_now = np.zeros((episodes, sim_steps, n), dtype=float)
+    x_now = np.zeros((episodes, sim_steps, n), dtype=float)
+    d_mean_now = np.zeros((episodes, sim_steps, n), dtype=float)
 
     eps = 1e-12
     ptr = 0
@@ -288,17 +292,10 @@ def run_monte_carlo(
 
         for t in range(sim_steps):
             x_des = ctx["x_ref_all"][t : t + horizon + 1]
-            d_affine = None
             d_mean = None
-            if gp_model is not None:
-                d_mean, _ = gp_model.predict_state_disturbance(
-                    x=x,
-                    beta_sigma=gp_beta_sigma,
-                )
-                d_affine = np.tile(d_mean.reshape(1, -1), (horizon, 1))
 
             try:
-                Xbar, Ubar = solve_rtmc_qp_paper(
+                Xbar, Ubar, _, d_mean = solve_rtmc_qp_with_gp_stagewise(
                     A=A,
                     B=B,
                     Qx=ctx["Qx"],
@@ -310,7 +307,9 @@ def run_monte_carlo(
                     z_half=ctx["z_half"],
                     x_bounds=(ctx["x_min_t"], ctx["x_max_t"]),
                     u_bounds=(ctx["u_min_t"], ctx["u_max_t"]),
-                    d_affine=d_affine,
+                    gp_model=gp_model,
+                    gp_beta_sigma=gp_beta_sigma,
+                    stagewise_refine_steps=1,
                 )
             except Exception as exc:
                 bx = int(ctx["bottleneck_x_dim"][0])
@@ -349,6 +348,11 @@ def run_monte_carlo(
 
             xbar0 = Xbar[0]
             ubar0 = Ubar[0]
+            center_now[ep, t] = xbar0
+            ref_now[ep, t] = x_des[0]
+            x_now[ep, t] = x
+            if d_mean is not None:
+                d_mean_now[ep, t] = np.asarray(d_mean, dtype=float).reshape(-1)
 
             u = ubar0 + K @ (x - xbar0)
             u = np.clip(u, ctx["u_min_base"], ctx["u_max_base"])
@@ -383,6 +387,10 @@ def run_monte_carlo(
         "ratio_now": ratio_now,
         "violations_now": violations_now,
         "used_w_half": w_half,
+        "center_now": center_now,
+        "ref_now": ref_now,
+        "x_now": x_now,
+        "d_mean_now": d_mean_now,
     }
 
 
@@ -410,7 +418,53 @@ def summarize(
         "is_reasonable_at_q": bool(np.max(q_ratio_now) <= 1.0 + float(violation_ratio_tol)),
         "violation_ratio_tol": float(violation_ratio_tol),
     }
+    if "center_now" in result and "ref_now" in result:
+        center = np.asarray(result["center_now"], dtype=float)
+        ref = np.asarray(result["ref_now"], dtype=float)
+        if center.ndim == 3 and center.shape[-1] >= 2:
+            err_xy = center[:, :, :2] - ref[:, :, :2]
+            err_norm = np.linalg.norm(err_xy, axis=2).reshape(-1)
+            summary["center_track_err_mean_xy"] = float(np.mean(err_norm))
+            summary["center_track_err_p99_xy"] = float(np.quantile(err_norm, q))
+            summary["center_track_err_max_xy"] = float(np.max(err_norm))
     return summary
+
+
+def plot_center_tracking(result: Dict[str, np.ndarray], out_path: Path, max_episode_lines: int = 5) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[warn] skip center plot: matplotlib unavailable ({exc})")
+        return
+
+    center = np.asarray(result.get("center_now", None))
+    ref = np.asarray(result.get("ref_now", None))
+    if center.ndim != 3 or ref.ndim != 3 or center.shape[-1] < 2:
+        print("[warn] skip center plot: center/ref history not available")
+        return
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111)
+    ax.plot(ref[0, :, 0], ref[0, :, 1], "k--", linewidth=1.5, label="reference")
+    ep_show = min(int(center.shape[0]), int(max_episode_lines))
+    for ep in range(ep_show):
+        ax.plot(
+            center[ep, :, 0],
+            center[ep, :, 1],
+            linewidth=1.2,
+            alpha=0.9 if ep == 0 else 0.45,
+            label=f"tube center ep{ep}" if ep < 3 else None,
+        )
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("n")
+    ax.set_ylabel("e")
+    ax.set_title("Monte: Tube Center vs Reference")
+    ax.legend(loc="best", frameon=False)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"center plot: {out_path}")
 
 
 def main() -> None:
@@ -436,7 +490,7 @@ def main() -> None:
     parser.add_argument(
         "--force_bound_mg",
         type=float,
-        default=0.5,
+        default=0.05,
         help="当 disturbance-mode=force_only 时生效：外力上限系数 c，使 ||f_ext||<=c*m*g。",
     )
     parser.add_argument(
@@ -448,7 +502,7 @@ def main() -> None:
     parser.add_argument(
         "--gp_model",
         type=str,
-        default="gp_model/iris_linear_residual_gp.npz",
+        default=None,
         help="Optional GP residual model (.npz)",
     )
     parser.add_argument(
@@ -463,6 +517,18 @@ def main() -> None:
         default="residual",
         help="GP收缩模式：none=不收缩；residual=base-gp_comp+gp_unc 的残差边界。",
     )
+    parser.add_argument(
+        "--plot_center",
+        dest="plot_center",
+        action="store_true",
+        help="输出 Monte 管中心与参考轨迹对比图（默认开启）。",
+    )
+    parser.add_argument(
+        "--no_plot_center",
+        dest="plot_center",
+        action="store_false",
+        help="关闭 Monte 管中心对比图输出。",
+    )
     parser.add_argument("--init-pos-jitter", type=float, default=0.05)
     parser.add_argument("--init-vel-jitter", type=float, default=0.05)
     parser.add_argument("--quantile", type=float, default=0.99)
@@ -472,6 +538,7 @@ def main() -> None:
         default=1e-6,
         help="越界判定相对容差：r0 > 1 + tol 才记为 violation。",
     )
+    parser.set_defaults(plot_center=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="montcarlo_runs")
     args = parser.parse_args()
@@ -576,7 +643,14 @@ def main() -> None:
         violations_now=result["violations_now"],
         z_half=ctx["z_half"],
         used_w_half=result["used_w_half"],
+        center_now=result["center_now"],
+        ref_now=result["ref_now"],
+        x_now=result["x_now"],
+        d_mean_now=result["d_mean_now"],
     )
+
+    if bool(args.plot_center) and args.task == "tracking":
+        plot_center_tracking(result, out_dir / f"{tag}_center_tracking.png")
 
     print("==== Monte Carlo Tube Radius Check ====")
     print(f"summary: {json_path}")
