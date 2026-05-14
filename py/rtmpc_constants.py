@@ -227,8 +227,8 @@ def base_state_bounds(dynamics: str) -> Tuple[np.ndarray, np.ndarray]:
     if dynamics == "iris_linear":
         # x=[pn,pe,vn,ve,pd,vd,phi,theta] (NED)
         return (
-            np.array([-8.0, -8.0, -5.0, -5.0, -5.0, -1.2, -1.0, -1.0], dtype=float),
-            np.array([8.0, 8.0, 5.0, 5.0, -0.2, 1.2, 1.0, 1.0], dtype=float),
+            np.array([-8.0, -8.0, -2.2, -2.2, -5.0, -0.6, -1.0, -1.0], dtype=float),
+            np.array([8.0, 8.0, 2.2, 2.2, -0.2, 0.6, 1.0, 1.0], dtype=float),
         )
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
 

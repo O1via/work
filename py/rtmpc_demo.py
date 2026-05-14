@@ -649,7 +649,7 @@ def demo(
     tracking_profile: str = "paper_baseline",
     sim_steps: int = 60,
     circle_radius: float = 4.0,
-    circle_period_steps: int = 63,
+    circle_period_steps: int = 126,
     plot_path: Optional[str] = None,
     augment_mode: str = "dense",
     include_onpolicy_teacher: bool = True,
@@ -1031,7 +1031,7 @@ if __name__ == "__main__":
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force_bound_mg", type=float, default=0.5, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_bound_mg", type=float, default=0.15, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--gp-model", type=str, default="gp_model/iris_linear_residual_gp.npz", help="Optional GP residual model (.npz)")
     parser.add_argument("--gp-beta-sigma", type=float, default=1.0, help="GP uncertainty envelope multiplier")
@@ -1048,9 +1048,9 @@ if __name__ == "__main__":
         default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
-    parser.add_argument("--sim-steps", type=int, default=100)
-    parser.add_argument("--circle-radius", type=float, default=5.0)
-    parser.add_argument("--circle-period-steps", type=int, default=79)
+    parser.add_argument("--sim-steps", type=int, default=150)
+    parser.add_argument("--circle-radius", type=float, default=4.0)
+    parser.add_argument("--circle-period-steps", type=int, default=126)
     parser.add_argument(
         "--augment-mode",
         choices=["dense", "sparse"],

@@ -563,8 +563,8 @@ def cli_fit() -> None:
         "--data",
         type=str,
         nargs="+",
-        default=["gp_data/transitions_all_filt4ms_1000_zosc05.npz"],
-        help="Transition npz files (default: gp_data/transitions_all_filt4ms_1000_zosc05.npz)",
+        default=["gp_data/transitions_all_filt2ms_1000.npz"],
+        help="Transition npz files (default: gp_data/transitions_all_filt2ms_1000.npz)",
     )
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)

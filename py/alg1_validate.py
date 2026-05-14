@@ -79,6 +79,8 @@ def build_validation_context(
     sim_steps: int,
     horizon: int,
     tracking_profile: str,
+    circle_radius: float,
+    circle_period_steps: int,
     dynamics: str,
     disturbance_mode: str,
     force_bound_mg: float,
@@ -173,6 +175,8 @@ def build_validation_context(
         sim_dt=sim.dt,
         total_steps=sim_steps,
         tracking_profile=tracking_profile,
+        circle_radius=float(circle_radius),
+        circle_period_steps=int(circle_period_steps),
     )
     if task == "tracking":
         x0_base = x_ref_all[0].copy()
@@ -612,26 +616,36 @@ def main() -> None:
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force_bound_mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_bound_mg", type=float, default=0.15, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--domain", choices=["source", "target", "both"], default="both")
     parser.add_argument("--episodes", type=int, default=5, help="Number of validation episodes per domain")
-    parser.add_argument("--sim-steps", type=int, default=100)
+    parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument(
         "--tracking-profile",
         choices=["paper_baseline", "high_speed_extension"],
-        default="paper_baseline",
+        default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--circle-radius", type=float, default=4.0, help="tracking 圆轨迹半径（m）")
+    parser.add_argument("--circle-period-steps", type=int, default=126, help="tracking 圆轨迹一圈步数（dt=0.1s）")
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--out-dir", type=str, default="validation_runs", help="Directory to save validation summaries and plots")
     parser.add_argument("--skip-expert", action="store_true", help="If set, do not run RTMPC expert rollouts")
-    parser.add_argument("--init-pos-jitter", type=float, default=0.5, help="Uniform initial position perturbation magnitude per axis")
-    parser.add_argument("--init-vel-jitter", type=float, default=0.1, help="Uniform initial velocity perturbation magnitude per axis")
-    parser.add_argument("--gp-model", type=str, default=None, help="Optional GP residual model (.npz)")
-    parser.add_argument("--gp-beta-sigma", type=float, default=2.0, help="GP uncertainty envelope multiplier")
+    parser.add_argument("--init-pos-jitter", type=float, default=0.1, help="Uniform initial position perturbation magnitude per axis")
+    parser.add_argument("--init-vel-jitter", type=float, default=0.05, help="Uniform initial velocity perturbation magnitude per axis")
+    parser.add_argument(
+        "--init-pos3d",
+        type=float,
+        nargs=3,
+        default=[4.0, 0.0, -0.8],
+        metavar=("PN", "PE", "PD"),
+        help="仅覆盖 rollout 初始三维位置 [pn, pe, pd]；不会修改参考轨迹。",
+    )
+    parser.add_argument("--gp-model", type=str, default="gp_model/iris_linear_residual_gp.npz", help="Optional GP residual model (.npz)")
+    parser.add_argument("--gp-beta-sigma", type=float, default=1.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
         "--gp-shrink-mode",
         choices=["none", "residual"],
@@ -646,6 +660,10 @@ def main() -> None:
     args = parser.parse_args()
     if not (0.0 <= args.force_d_axis_scale <= 1.0):
         raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
+    if args.circle_radius <= 0.0:
+        raise ValueError("circle_radius 必须 > 0")
+    if args.circle_period_steps <= 0:
+        raise ValueError("circle_period_steps 必须 > 0")
 
     # VS Code 的 Run Code 常不带参数；此时默认开启交互轨迹窗口，便于直接旋转视角。
     if len(sys.argv) == 1 and not args.interactive_trajectory:
@@ -668,6 +686,8 @@ def main() -> None:
         sim_steps=args.sim_steps,
         horizon=args.horizon,
         tracking_profile=args.tracking_profile,
+        circle_radius=float(args.circle_radius),
+        circle_period_steps=int(args.circle_period_steps),
         dynamics=args.dynamics,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
@@ -686,6 +706,8 @@ def main() -> None:
     ckpt_dyn = ckpt.get("dynamics")
     ckpt_horizon = ckpt.get("horizon")
     ckpt_tracking_profile = ckpt.get("tracking_profile")
+    ckpt_circle_radius = ckpt.get("circle_radius")
+    ckpt_circle_period_steps = ckpt.get("circle_period_steps")
     if ckpt_task is not None and str(ckpt_task) != str(args.task):
         raise ValueError(f"checkpoint 任务不匹配：checkpoint task={ckpt_task}, 当前 task={args.task}")
     if ckpt_dyn is not None and str(ckpt_dyn) != str(args.dynamics):
@@ -698,6 +720,16 @@ def main() -> None:
         raise ValueError(
             "checkpoint tracking_profile 不匹配："
             f"checkpoint tracking_profile={ckpt_tracking_profile}, 当前 tracking_profile={args.tracking_profile}"
+        )
+    if ckpt_circle_radius is not None and float(ckpt_circle_radius) != float(args.circle_radius):
+        raise ValueError(
+            "checkpoint circle_radius 不匹配："
+            f"checkpoint circle_radius={ckpt_circle_radius}, 当前 circle_radius={args.circle_radius}"
+        )
+    if ckpt_circle_period_steps is not None and int(ckpt_circle_period_steps) != int(args.circle_period_steps):
+        raise ValueError(
+            "checkpoint circle_period_steps 不匹配："
+            f"checkpoint circle_period_steps={ckpt_circle_period_steps}, 当前 circle_period_steps={args.circle_period_steps}"
         )
 
     if input_dim != expected_input_dim:
@@ -717,7 +749,17 @@ def main() -> None:
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
 
-    base_x0 = ctx["x0_base"]
+    base_x0 = np.asarray(ctx["x0_base"], dtype=float).copy()
+    if args.init_pos3d is not None:
+        if base_x0.size < 5:
+            raise ValueError("当前状态维度不支持 3D 位置覆盖（需要至少 5 维，含 pn/pe/pd）")
+        base_x0[0] = float(args.init_pos3d[0])
+        base_x0[1] = float(args.init_pos3d[1])
+        base_x0[4] = float(args.init_pos3d[2])  # NED: Down
+        print(
+            "[info] rollout initial position override: "
+            f"pn={base_x0[0]:.3f}, pe={base_x0[1]:.3f}, pd={base_x0[4]:.3f}"
+        )
 
     domains = [args.domain] if args.domain != "both" else ["source", "target"]
     overall_summary: Dict[str, Dict[str, float]] = {}
@@ -731,6 +773,8 @@ def main() -> None:
         episode_rng = np.random.default_rng(args.seed)
         policy_metrics_all: List[Dict[str, float]] = []
         expert_metrics_all: List[Dict[str, float]] = []
+        expert_infeasible_count = 0
+        expert_feasible_count = 0
         first_policy_rollout: Optional[Dict[str, np.ndarray]] = None
         first_expert_rollout: Optional[Dict[str, np.ndarray]] = None
         saved_rollouts = []
@@ -738,9 +782,10 @@ def main() -> None:
         policy_infer_times = []
         policy_avg_infer_times = []
         for ep in range(args.episodes):
+            # 仅修改 rollout 的初始状态，不修改参考轨迹 ctx["x_ref_all"]。
+            x0_seed = np.asarray(base_x0, dtype=float).copy()
             x0_ep = sample_initial_state(
-                base_x0=base_x0,
-                # base_x0=np.array([1.0, 0.5, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0], dtype=float),
+                base_x0=x0_seed,
                 rng=episode_rng,
                 pos_jitter=args.init_pos_jitter,
                 vel_jitter=args.init_vel_jitter,
@@ -781,17 +826,24 @@ def main() -> None:
 
             expert_rollout = None
             expert_metrics = None
+            expert_error: Optional[str] = None
             if not args.skip_expert:
-                expert_rollout = rollout_expert(
-                    task=args.task,
-                    sim_steps=args.sim_steps,
-                    horizon=args.horizon,
-                    x0=x0_ep,
-                    disturbances=disturbances,
-                    ctx=ctx,
-                )
-                expert_metrics = compute_metrics(expert_rollout)
-                expert_metrics_all.append(expert_metrics)
+                try:
+                    expert_rollout = rollout_expert(
+                        task=args.task,
+                        sim_steps=args.sim_steps,
+                        horizon=args.horizon,
+                        x0=x0_ep,
+                        disturbances=disturbances,
+                        ctx=ctx,
+                    )
+                    expert_metrics = compute_metrics(expert_rollout)
+                    expert_metrics_all.append(expert_metrics)
+                    expert_feasible_count += 1
+                except Exception as exc:
+                    expert_infeasible_count += 1
+                    expert_error = str(exc)
+                    print(f"[warn] episode {ep+1:02d} expert rollout infeasible: {expert_error}")
 
             if first_policy_rollout is None:
                 first_policy_rollout = policy_rollout
@@ -803,6 +855,8 @@ def main() -> None:
                     "x0": x0_ep.tolist(),
                     "policy_metrics": policy_metrics,
                     "expert_metrics": expert_metrics,
+                    "expert_infeasible": bool(expert_error is not None),
+                    "expert_error": expert_error,
                 }
             )
 
@@ -812,6 +866,8 @@ def main() -> None:
             )
             if expert_metrics is not None:
                 msg += f" | expert pos_rmse={expert_metrics['pos_rmse']:.4f} success={expert_metrics['success']}"
+            elif expert_error is not None:
+                msg += " | expert infeasible"
             print(msg)
 
         # 输出所有 episode 的平均推理时间
@@ -829,6 +885,11 @@ def main() -> None:
             "episodes": args.episodes,
             "policy": policy_summary,
             "expert": expert_summary,
+            "expert_feasible_episodes": int(expert_feasible_count),
+            "expert_infeasible_episodes": int(expert_infeasible_count),
+            "expert_infeasible_ratio": (
+                float(expert_infeasible_count) / float(args.episodes) if args.episodes > 0 else 0.0
+            ),
         }
 
         print("policy summary:")

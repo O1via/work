@@ -48,6 +48,8 @@ def build_context(
     gp_model_path: Optional[str] = None,
     gp_beta_sigma: float = 2.0,
     gp_shrink_mode: str = "residual",
+    circle_radius: float = 4.0,
+    circle_period_steps: int = 126,
 ) -> Dict[str, np.ndarray]:
     if dynamics == "double_integrator":
         sim = DoubleIntegrator(dt=0.1)
@@ -182,6 +184,8 @@ def build_context(
         sim_dt=sim.dt,
         total_steps=sim_steps,
         tracking_profile=tracking_profile,
+        circle_radius=float(circle_radius),
+        circle_period_steps=int(circle_period_steps),
     )
     if task == "tracking":
         x0 = x_ref_all[0].copy()
@@ -225,6 +229,8 @@ def build_context(
         "force_d_axis_scale": np.array([float(force_d_axis_scale)]),
         "dt": np.array([float(sim.dt)]),
         "tracking_profile": np.array([tracking_profile]),
+        "circle_radius": np.array([float(circle_radius)]),
+        "circle_period_steps": np.array([int(circle_period_steps)], dtype=int),
         "gp_model": gp_model,
         "gp_beta_sigma": np.array([float(gp_beta_sigma)]),
         "gp_shrink_mode": gp_shrink_mode,
@@ -480,6 +486,8 @@ def main() -> None:
         default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
+    parser.add_argument("--circle-radius", type=float, default=4.0, help="tracking 圆轨迹半径（m）")
+    parser.add_argument("--circle-period-steps", type=int, default=126, help="tracking 圆轨迹一圈步数（dt=0.1s）")
     parser.add_argument("--disturbance-scale", type=float, default=1.0, help="对当前 w_half 的缩放系数")
     parser.add_argument(
         "--disturbance-mode",
@@ -490,7 +498,7 @@ def main() -> None:
     parser.add_argument(
         "--force_bound_mg",
         type=float,
-        default=0.05,
+        default=0.15,
         help="当 disturbance-mode=force_only 时生效：外力上限系数 c，使 ||f_ext||<=c*m*g。",
     )
     parser.add_argument(
@@ -502,7 +510,7 @@ def main() -> None:
     parser.add_argument(
         "--gp_model",
         type=str,
-        default=None,
+        default="gp_model/iris_linear_residual_gp.npz",
         help="Optional GP residual model (.npz)",
     )
     parser.add_argument(
@@ -549,6 +557,10 @@ def main() -> None:
         raise ValueError("disturbance-scale 必须 > 0")
     if args.force_bound_mg < 0.0:
         raise ValueError("force_bound_mg 必须 >= 0")
+    if args.circle_radius <= 0.0:
+        raise ValueError("circle_radius 必须 > 0")
+    if args.circle_period_steps <= 0:
+        raise ValueError("circle_period_steps 必须 > 0")
     if not (0.0 <= args.force_d_axis_scale <= 1.0):
         raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
     if not (0.0 < args.quantile < 1.0):
@@ -568,6 +580,8 @@ def main() -> None:
         gp_model_path=args.gp_model,
         gp_beta_sigma=float(args.gp_beta_sigma),
         gp_shrink_mode=args.gp_shrink_mode,
+        circle_radius=float(args.circle_radius),
+        circle_period_steps=int(args.circle_period_steps),
     )
 
     result = run_monte_carlo(
@@ -595,8 +609,10 @@ def main() -> None:
             "episodes": int(args.episodes),
             "sim_steps": int(args.sim_steps),
             "horizon": int(args.horizon),
-            "tracking_profile": args.tracking_profile,
-            "disturbance_scale": float(args.disturbance_scale),
+                "tracking_profile": args.tracking_profile,
+                "circle_radius": float(args.circle_radius),
+                "circle_period_steps": int(args.circle_period_steps),
+                "disturbance_scale": float(args.disturbance_scale),
             "disturbance_mode": args.disturbance_mode,
             "force_bound_mg": float(args.force_bound_mg),
             "force_d_axis_scale": float(args.force_d_axis_scale),

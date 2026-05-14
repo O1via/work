@@ -260,6 +260,8 @@ def make_reference(
     sim_dt: float,
     total_steps: int,
     tracking_profile: str = "paper_baseline",
+    circle_radius: float = 4.0,
+    circle_period_steps: int = 126,
 ) -> np.ndarray:
     n = x0.shape[0]
     if task == "point":
@@ -271,14 +273,17 @@ def make_reference(
     total_len = total_steps + N + 1
     if tracking_profile not in ("paper_baseline", "high_speed_extension"):
         raise ValueError("tracking_profile must be paper_baseline or high_speed_extension")
-    circle_radius = 4.0
-    period_steps = 63
+    if circle_radius <= 0.0:
+        raise ValueError("circle_radius must be positive")
+    if circle_period_steps <= 0:
+        raise ValueError("circle_period_steps must be positive")
+    period_steps = int(circle_period_steps)
     if n == 4:
         return build_circle_reference(
             x0=x0,
             total_len=total_len,
             dt=float(sim_dt),
-            radius=circle_radius,
+            radius=float(circle_radius),
             period_steps=period_steps,
         )
 
@@ -289,7 +294,7 @@ def make_reference(
             x0=x0[:4],
             total_len=total_len,
             dt=float(sim_dt),
-            radius=circle_radius,
+            radius=float(circle_radius),
             period_steps=period_steps,
         )
         out = np.zeros((total_len, n), dtype=float)
@@ -327,16 +332,18 @@ def main() -> None:
         default="force_only",
         help="扰动构造方案：state_box=仅用当前状态扰动盒；force_only=仅用外力边界映射。",
     )
-    parser.add_argument("--force_bound_mg", type=float, default=0.05, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
+    parser.add_argument("--force_bound_mg", type=float, default=0.15, help="外力边界系数 c，使 ||f_ext||<=c*m*g")
     parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--cycles", type=int, default=8, help="Number of Algorithm 1 iterations")
-    parser.add_argument("--sim-steps", type=int, default=100, help="Receding-horizon steps per cycle")
+    parser.add_argument("--sim-steps", type=int, default=120, help="Receding-horizon steps per cycle")
     parser.add_argument(
         "--tracking-profile",
         choices=["paper_baseline", "high_speed_extension"],
-        default="paper_baseline",
+        default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
+    parser.add_argument("--circle-radius", type=float, default=4.0, help="tracking 圆轨迹半径（m）")
+    parser.add_argument("--circle-period-steps", type=int, default=126, help="tracking 圆轨迹一圈步数（dt=0.1s）")
     parser.add_argument("--horizon", type=int, default=30, help="MPC prediction horizon N")
     parser.add_argument("--augment", choices=["dense", "sparse"], default="dense")
 
@@ -361,8 +368,8 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--init-checkpoint", type=str, default=None, help="Optional checkpoint to warm-start student")
-    parser.add_argument("--gp-model", type=str, default=None, help="Optional GP residual model (.npz)")
-    parser.add_argument("--gp-beta-sigma", type=float, default=2.0, help="GP uncertainty envelope multiplier")
+    parser.add_argument("--gp-model", type=str, default="gp_model/iris_linear_residual_gp.npz", help="Optional GP residual model (.npz)")
+    parser.add_argument("--gp-beta-sigma", type=float, default=1.0, help="GP uncertainty envelope multiplier")
     parser.add_argument(
         "--gp-shrink-mode",
         choices=["none", "residual"],
@@ -378,6 +385,10 @@ def main() -> None:
     args = parser.parse_args()
     if not (0.0 <= args.force_d_axis_scale <= 1.0):
         raise ValueError("force_d_axis_scale 必须在 [0,1] 内")
+    if args.circle_radius <= 0.0:
+        raise ValueError("circle_radius 必须 > 0")
+    if args.circle_period_steps <= 0:
+        raise ValueError("circle_period_steps 必须 > 0")
 
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, args.log_file)
@@ -478,6 +489,8 @@ def main() -> None:
         sim_dt=sim.dt,
         total_steps=sim_steps,
         tracking_profile=args.tracking_profile,
+        circle_radius=float(args.circle_radius),
+        circle_period_steps=int(args.circle_period_steps),
     )
 
     # 与 rtmpc_demo 的 circle tracking 行为一致：将初始状态对齐到参考的第一个点。
@@ -643,6 +656,8 @@ def main() -> None:
                 "horizon": int(args.horizon),
                 "sim_steps": int(args.sim_steps),
                 "tracking_profile": args.tracking_profile,
+                "circle_radius": float(args.circle_radius),
+                "circle_period_steps": int(args.circle_period_steps),
                 "cycle": cycle_idx + 1,
             },
             ckpt_path,
