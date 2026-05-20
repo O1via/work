@@ -14,13 +14,16 @@ if _THIS_DIR not in sys.path:
 from alg1_dagger import make_reference
 from gp_residual_model import VelocityResidualGP, residual_shrink_bounds
 from rtmpc_demo import (
-    DoubleIntegrator,
     LinearIrisHover,
     compute_infinite_lqr,
     compute_rpi_box,
     solve_rtmc_qp_with_gp_stagewise,
     tighten_box_bounds_with_auto_scale,
 )
+
+FIXED_DYNAMICS = "iris_linear"
+FIXED_TASK = "tracking"
+FIXED_TRACKING_PROFILE = "high_speed_extension"
 from rtmpc_constants import (
     base_initial_state,
     base_input_bounds,
@@ -38,11 +41,8 @@ def _arr_str(x: np.ndarray) -> str:
 
 
 def build_context(
-    dynamics: str,
-    task: str,
     sim_steps: int,
     horizon: int,
-    tracking_profile: str,
     disturbance_mode: str,
     force_bound_mg: float,
     force_d_axis_scale: float,
@@ -52,10 +52,10 @@ def build_context(
     circle_radius: float = 4.0,
     circle_period_steps: int = 126,
 ) -> Dict[str, np.ndarray]:
-    if dynamics == "double_integrator":
-        sim = DoubleIntegrator(dt=0.1)
-    else:
-        sim = LinearIrisHover(dt=0.1, mass=1.5)
+    dynamics = FIXED_DYNAMICS
+    task = FIXED_TASK
+    tracking_profile = FIXED_TRACKING_PROFILE
+    sim = LinearIrisHover(dt=0.1, mass=1.5)
 
     A, B = sim.A, sim.B
     n, m = A.shape[0], B.shape[1]
@@ -87,10 +87,7 @@ def build_context(
     )
     w_half_nominal = w_half.copy()
     x_min_base, x_max_base = base_state_bounds(dynamics)
-    if dynamics == "double_integrator":
-        u_min_base, u_max_base = base_input_bounds(dynamics, m=m)
-    else:
-        u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
+    u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
 
     gp_x_min, gp_x_max = gp_query_state_bounds(dynamics)
     gp_model = None
@@ -182,7 +179,6 @@ def build_context(
 
     x0 = base_initial_state(dynamics)
     x_ref_all = make_reference(
-        task,
         x0=x0,
         N=horizon,
         sim_dt=sim.dt,
@@ -191,8 +187,7 @@ def build_context(
         circle_radius=float(circle_radius),
         circle_period_steps=int(circle_period_steps),
     )
-    if task == "tracking":
-        x0 = x_ref_all[0].copy()
+    x0 = x_ref_all[0].copy()
 
     return {
         "A": A,
@@ -486,18 +481,12 @@ def plot_center_tracking(result: Dict[str, np.ndarray], out_path: Path, max_epis
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Monte Carlo 检查当前 tube 半径 z_half 是否合理")
-    parser.add_argument("--task", choices=["point", "tracking"], default="tracking")
-    parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
+    parser = argparse.ArgumentParser(
+        description="Monte Carlo 检查（固定工作流: iris_linear + circle tracking）"
+    )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--horizon", type=int, default=30)
-    parser.add_argument(
-        "--tracking-profile",
-        choices=["paper_baseline", "high_speed_extension"],
-        default="high_speed_extension",
-        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
-    )
     parser.add_argument("--circle-radius", type=float, default=4.0, help="tracking 圆轨迹半径（m）")
     parser.add_argument("--circle-period-steps", type=int, default=126, help="tracking 圆轨迹一圈步数（dt=0.1s）")
     parser.add_argument("--disturbance-scale", type=float, default=1.0, help="对当前 w_half 的缩放系数")
@@ -581,11 +570,8 @@ def main() -> None:
         raise ValueError("violation_ratio_tol 必须 >= 0")
 
     ctx = build_context(
-        args.dynamics,
-        args.task,
         args.sim_steps,
         args.horizon,
-        tracking_profile=args.tracking_profile,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
         force_d_axis_scale=args.force_d_axis_scale,
@@ -616,12 +602,12 @@ def main() -> None:
     )
     summary.update(
         {
-            "task": args.task,
-            "dynamics": args.dynamics,
+            "task": FIXED_TASK,
+            "dynamics": FIXED_DYNAMICS,
             "episodes": int(args.episodes),
             "sim_steps": int(args.sim_steps),
             "horizon": int(args.horizon),
-                "tracking_profile": args.tracking_profile,
+                "tracking_profile": FIXED_TRACKING_PROFILE,
                 "circle_radius": float(args.circle_radius),
                 "circle_period_steps": int(args.circle_period_steps),
                 "disturbance_scale": float(args.disturbance_scale),
@@ -657,7 +643,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tag = f"mc_tube_{args.dynamics}_{args.task}"
+    tag = f"mc_tube_{FIXED_DYNAMICS}_{FIXED_TASK}"
     json_path = out_dir / f"{tag}_summary.json"
     npz_path = out_dir / f"{tag}_samples.npz"
 
@@ -677,7 +663,7 @@ def main() -> None:
         d_mean_now=result["d_mean_now"],
     )
 
-    if bool(args.plot_center) and args.task == "tracking":
+    if bool(args.plot_center):
         plot_center_tracking(result, out_dir / f"{tag}_center_tracking.png")
 
     print("==== Monte Carlo Tube Radius Check ====")

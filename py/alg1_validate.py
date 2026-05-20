@@ -29,6 +29,18 @@ _maybe_reexec_into_workspace_venv()
 import numpy as np
 import torch
 
+
+def _parse_bool(v: object) -> bool:
+    """解析命令行布尔值，支持 true/false/1/0/yes/no/on/off。"""
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid bool value: {v}")
+
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
@@ -36,13 +48,16 @@ if _THIS_DIR not in sys.path:
 from alg1_dagger import build_mlp, load_policy_checkpoint, make_policy_input, make_reference, policy_forward
 from gp_residual_model import VelocityResidualGP, residual_shrink_bounds
 from rtmpc_demo import (
-    DoubleIntegrator,
     LinearIrisHover,
     compute_infinite_lqr,
     compute_rpi_box,
     solve_rtmc_qp_with_gp_stagewise,
     tighten_box_bounds_with_auto_scale,
 )
+
+FIXED_DYNAMICS = "iris_linear"
+FIXED_TASK = "tracking"
+FIXED_TRACKING_PROFILE = "high_speed_extension"
 from rtmpc_constants import (
     base_initial_state,
     base_input_bounds,
@@ -76,13 +91,10 @@ def resolve_checkpoint(checkpoint: Optional[str], run_dir: str) -> str:
 
 # 将验证环境的系统矩阵、LQR增益、约束等信息构建到一个字典中，供后续rollout使用
 def build_validation_context(
-    task: str,
     sim_steps: int,
     horizon: int,
-    tracking_profile: str,
     circle_radius: float,
     circle_period_steps: int,
-    dynamics: str,
     disturbance_mode: str,
     force_bound_mg: float,
     force_d_axis_scale: float,
@@ -90,10 +102,9 @@ def build_validation_context(
     gp_beta_sigma: float = 2.0,
     gp_shrink_mode: str = "residual",
 ) -> Dict[str, np.ndarray]:
-    if dynamics == "double_integrator":
-        sim = DoubleIntegrator(dt=0.1)
-    else:
-        sim = LinearIrisHover(dt=0.1, mass=1.5)
+    dynamics = FIXED_DYNAMICS
+    tracking_profile = FIXED_TRACKING_PROFILE
+    sim = LinearIrisHover(dt=0.1, mass=1.5)
 
     A, B = sim.A, sim.B
     n, m = A.shape[0], B.shape[1]
@@ -115,10 +126,7 @@ def build_validation_context(
     gp_comp_half = np.zeros_like(w_half_target)
 
     x_min_base, x_max_base = base_state_bounds(dynamics)
-    if dynamics == "double_integrator":
-        u_min_base, u_max_base = base_input_bounds(dynamics, m=m)
-    else:
-        u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
+    u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
 
     if gp_model_path:
         gp_path = Path(gp_model_path)
@@ -175,7 +183,6 @@ def build_validation_context(
         print(f"[info] tighten scale factors: gamma_x={gamma_x:.4f}, gamma_u={gamma_u:.4f}")
 
     x_ref_all = make_reference(
-        task,
         x0=x0_base,
         N=horizon,
         sim_dt=sim.dt,
@@ -184,8 +191,7 @@ def build_validation_context(
         circle_radius=float(circle_radius),
         circle_period_steps=int(circle_period_steps),
     )
-    if task == "tracking":
-        x0_base = x_ref_all[0].copy()
+    x0_base = x_ref_all[0].copy()
 
     return {
         "A": A,
@@ -234,7 +240,6 @@ def sample_initial_state(base_x0: np.ndarray, rng: np.random.Generator, pos_jitt
 # 学生策略推理验证
 def rollout_policy(
     model: torch.nn.Module,
-    task: str,
     sim_steps: int,
     horizon: int,
     device: str,
@@ -253,7 +258,7 @@ def rollout_policy(
     t_start = time.perf_counter()
     for t in range(sim_steps):
         x_des = ctx["x_ref_all"][t : t + horizon + 1]
-        inp = make_policy_input(task, x=x, x_des_window=x_des, t=t)
+        inp = make_policy_input(x=x, x_des_window=x_des, t=t)
         u = policy_forward(model, inp, device=device)
         u = np.clip(u, ctx["u_min_base"], ctx["u_max_base"])
 
@@ -283,7 +288,6 @@ def rollout_policy(
 
 # RTMPC专家策略验证
 def rollout_expert(
-    task: str,
     sim_steps: int,
     horizon: int,
     x0: np.ndarray,
@@ -387,6 +391,7 @@ def maybe_plot_domain(
     policy_rollout: Dict[str, np.ndarray],
     expert_rollout: Optional[Dict[str, np.ndarray]],
     z_half: Optional[np.ndarray] = None,
+    draw_tube_envelope: bool = True,
     interactive_trajectory: bool = False,
 ) -> Optional[object]:
     if interactive_trajectory:
@@ -461,7 +466,7 @@ def maybe_plot_domain(
                 linewidth=linewidth,
             )
 
-    # 轨迹图：double_integrator 用 2D；iris(8维) 默认输出 3D 位置轨迹。
+    # 轨迹图：固定输出 iris(8维) 的 3D 位置轨迹。
     if refs.shape[1] >= 5:
         fig = plt.figure(figsize=(7, 6))
         ax = fig.add_subplot(111, projection="3d")
@@ -474,7 +479,7 @@ def maybe_plot_domain(
             xs_expert = expert_rollout["xs"]
             ax.plot(xs_expert[:, 1], xs_expert[:, 0], -xs_expert[:, 4], "b-", linewidth=1.6, label="expert")
 
-        if z_half is not None and refs.shape[1] >= 5:
+        if draw_tube_envelope and z_half is not None and refs.shape[1] >= 5:
             z = np.asarray(z_half, dtype=float).reshape(-1)
             if z.size >= 5:
                 # NED -> plot axes: x=e(pe), y=n(pn), z=up(-pd)
@@ -601,7 +606,7 @@ def maybe_plot_domain(
         else:
             plt.close(fig)
 
-    # 位置误差：iris 使用 3D 位置误差（n,e,pd），double_integrator 使用 2D。
+    # 位置误差：固定使用 3D 位置误差（n,e,pd）。
     pos_idx = [0, 1, 4] if refs.shape[1] >= 5 else [0, 1]
     pos_err_policy = np.linalg.norm(xs_policy[:-1, pos_idx] - refs[:, pos_idx], axis=1)
     fig, ax = plt.subplots(figsize=(7, 4))
@@ -714,16 +719,11 @@ def maybe_plot_domain(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate a trained DAgger policy in source/target domains")
+    parser = argparse.ArgumentParser(
+        description="Validate DAgger policy (fixed workflow: iris_linear + circle tracking)"
+    )
     parser.add_argument("--checkpoint", type=str, default=None, help="Policy checkpoint to validate. If omitted, the latest checkpoint under --run-dir is used.")
     parser.add_argument("--run-dir", type=str, default="dagger_runs", help="Training output directory containing policy_cycle_*.pt")
-    parser.add_argument("--task", choices=["point", "tracking"], default="tracking")
-    parser.add_argument(
-        "--dynamics",
-        choices=["double_integrator", "iris_linear"],
-        default="iris_linear",
-        help="Dynamics model used by linear RTMPC expert and rollout simulation.",
-    )
     parser.add_argument(
         "--disturbance-mode",
         choices=["state_box", "force_only"],
@@ -736,12 +736,6 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=5, help="Number of validation episodes per domain")
     parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--horizon", type=int, default=30)
-    parser.add_argument(
-        "--tracking-profile",
-        choices=["paper_baseline", "high_speed_extension"],
-        default="high_speed_extension",
-        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
-    )
     parser.add_argument("--circle-radius", type=float, default=4.0, help="tracking 圆轨迹半径（m）")
     parser.add_argument("--circle-period-steps", type=int, default=126, help="tracking 圆轨迹一圈步数（dt=0.1s）")
     parser.add_argument("--seed", type=int, default=1)
@@ -754,7 +748,7 @@ def main() -> None:
         "--init-pos3d",
         type=float,
         nargs=3,
-        default=[-4.0, 0.0, -0.8],
+        default=[4.5, 0.0, -1.0],
         metavar=("PN", "PE", "PD"),
         help="仅覆盖 rollout 初始三维位置 [pn, pe, pd]；不会修改参考轨迹。",
     )
@@ -770,6 +764,12 @@ def main() -> None:
         "--interactive-trajectory",
         action="store_true",
         help="Show interactive trajectory figure window (3D view can be rotated with mouse).",
+    )
+    parser.add_argument(
+        "--plot-tube-envelope",
+        type=_parse_bool,
+        default=False,
+        help="是否在 3D 轨迹图中绘制青色 tube 包络线/截面线框（true/false）。",
     )
     args = parser.parse_args()
     if not (0.0 <= args.force_d_axis_scale <= 1.0):
@@ -796,13 +796,10 @@ def main() -> None:
     ckpt = load_policy_checkpoint(ckpt_path)
     hidden = tuple(int(h) for h in ckpt.get("hidden", (128, 128)))
     ctx = build_validation_context(
-        task=args.task,
         sim_steps=args.sim_steps,
         horizon=args.horizon,
-        tracking_profile=args.tracking_profile,
         circle_radius=float(args.circle_radius),
         circle_period_steps=int(args.circle_period_steps),
-        dynamics=args.dynamics,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
         force_d_axis_scale=args.force_d_axis_scale,
@@ -815,25 +812,25 @@ def main() -> None:
 
     n = int(ctx["n"][0])
     m = int(ctx["m"][0])
-    expected_input_dim = (n + (args.horizon + 1) * n) if args.task == "tracking" else (2 * n + 1)
+    expected_input_dim = n + (args.horizon + 1) * n
     ckpt_task = ckpt.get("task")
     ckpt_dyn = ckpt.get("dynamics")
     ckpt_horizon = ckpt.get("horizon")
     ckpt_tracking_profile = ckpt.get("tracking_profile")
     ckpt_circle_radius = ckpt.get("circle_radius")
     ckpt_circle_period_steps = ckpt.get("circle_period_steps")
-    if ckpt_task is not None and str(ckpt_task) != str(args.task):
-        raise ValueError(f"checkpoint 任务不匹配：checkpoint task={ckpt_task}, 当前 task={args.task}")
-    if ckpt_dyn is not None and str(ckpt_dyn) != str(args.dynamics):
-        raise ValueError(f"checkpoint 动力学不匹配：checkpoint dynamics={ckpt_dyn}, 当前 dynamics={args.dynamics}")
+    if ckpt_task is not None and str(ckpt_task) != FIXED_TASK:
+        raise ValueError(f"checkpoint 任务不匹配：checkpoint task={ckpt_task}, 当前 task={FIXED_TASK}")
+    if ckpt_dyn is not None and str(ckpt_dyn) != FIXED_DYNAMICS:
+        raise ValueError(f"checkpoint 动力学不匹配：checkpoint dynamics={ckpt_dyn}, 当前 dynamics={FIXED_DYNAMICS}")
     if ckpt_horizon is not None and int(ckpt_horizon) != int(args.horizon):
         raise ValueError(
             f"checkpoint 预测时域不匹配：checkpoint horizon={ckpt_horizon}, 当前 horizon={args.horizon}"
         )
-    if ckpt_tracking_profile is not None and str(ckpt_tracking_profile) != str(args.tracking_profile):
+    if ckpt_tracking_profile is not None and str(ckpt_tracking_profile) != FIXED_TRACKING_PROFILE:
         raise ValueError(
             "checkpoint tracking_profile 不匹配："
-            f"checkpoint tracking_profile={ckpt_tracking_profile}, 当前 tracking_profile={args.tracking_profile}"
+            f"checkpoint tracking_profile={ckpt_tracking_profile}, 当前 tracking_profile={FIXED_TRACKING_PROFILE}"
         )
     if ckpt_circle_radius is not None and float(ckpt_circle_radius) != float(args.circle_radius):
         raise ValueError(
@@ -850,7 +847,7 @@ def main() -> None:
         raise ValueError(
             "checkpoint 与当前验证配置不一致："
             f"checkpoint input_dim={input_dim}, expected={expected_input_dim}。"
-            "请使用匹配的 --checkpoint，或对齐 --task/--dynamics/--horizon。"
+            "请使用匹配的 --checkpoint，或对齐当前固定验证配置。"
         )
     if output_dim != m:
         raise ValueError(
@@ -912,7 +909,7 @@ def main() -> None:
                 for tt in range(args.sim_steps):
                     disturbances[tt] = sample_process_disturbance(
                         rng=episode_rng,
-                        dynamics=args.dynamics,
+                        dynamics=FIXED_DYNAMICS,
                         dt=float(ctx["dt"][0]),
                         mode=str(ctx["disturbance_mode"]),
                         force_bound_mg=float(ctx["force_bound_mg"][0]),
@@ -923,7 +920,6 @@ def main() -> None:
 
             policy_rollout = rollout_policy(
                 model=model,
-                task=args.task,
                 sim_steps=args.sim_steps,
                 horizon=args.horizon,
                 device=args.device,
@@ -944,7 +940,6 @@ def main() -> None:
             if not args.skip_expert:
                 try:
                     expert_rollout = rollout_expert(
-                        task=args.task,
                         sim_steps=args.sim_steps,
                         horizon=args.horizon,
                         x0=x0_ep,
@@ -1042,6 +1037,7 @@ def main() -> None:
                 first_policy_rollout,
                 first_expert_rollout,
                 z_half=ctx["z_half"],
+                draw_tube_envelope=bool(args.plot_tube_envelope),
                 interactive_trajectory=args.interactive_trajectory,
             )
             if maybe_fig is not None:

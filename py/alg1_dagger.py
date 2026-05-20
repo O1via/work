@@ -99,7 +99,6 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from rtmpc_demo import (
-    DoubleIntegrator,
     LinearIrisHover,
     apply_tracking_profile_iris,
     build_circle_reference,
@@ -119,6 +118,10 @@ from rtmpc_constants import (
     input_cost_matrix,
     state_cost_matrix,
 )
+
+FIXED_DYNAMICS = "iris_linear"
+FIXED_TASK = "tracking"
+FIXED_TRACKING_PROFILE = "high_speed_extension"
 
 # 构建MLP 学生策略网络，输入单个状态/参考窗口，输出单个动作。
 def build_mlp(input_dim: int, output_dim: int, hidden: Tuple[int, ...]) -> nn.Module:
@@ -148,20 +151,11 @@ def policy_forward(model: nn.Module, policy_in: np.ndarray, device: str) -> np.n
     return ub.detach().cpu().numpy()
 
 # 根据任务把状态和参考拼成策略输入，供模型前向使用和训练数据构造。
-def make_policy_input(task: str, x: np.ndarray, x_des_window: np.ndarray, t: int) -> np.ndarray:
-    """构造论文符号里的策略输入 x_in。
-
-    - tracking: x_in = {x_t, X^des_t}，这里将 X^des_t (N+1,n) 展平拼到后面。
-    - point:    x_in = {x_t, x^des_{0|t}, t}，这里使用 x_des_window[0] 作为目标状态，并附加标量 t。
-    """
+def make_policy_input(x: np.ndarray, x_des_window: np.ndarray, t: int) -> np.ndarray:
+    """构造策略输入（固定为 tracking）：x_in = {x_t, X^des_t}。"""
     x = np.asarray(x).reshape(-1)
     x_des_window = np.asarray(x_des_window)
-    if task == "tracking":
-        return np.concatenate([x, x_des_window.reshape(-1)])
-    if task == "point":
-        x_goal = x_des_window[0].reshape(-1)
-        return np.concatenate([x, x_goal, np.array([float(t)], dtype=float)])
-    raise ValueError("task must be point or tracking")
+    return np.concatenate([x, x_des_window.reshape(-1)])
 
 
 # 计算当前轮次的 β 值
@@ -255,38 +249,27 @@ def train_one_cycle(
 
 
 def make_reference(
-    task: str,
     x0: np.ndarray,
     N: int,
     sim_dt: float,
     total_steps: int,
-    tracking_profile: str = "paper_baseline",
+    tracking_profile: str = FIXED_TRACKING_PROFILE,
     circle_radius: float = 4.0,
     circle_period_steps: int = 126,
 ) -> np.ndarray:
     n = x0.shape[0]
-    if task == "point":
-        return np.zeros((total_steps + N + 1, n))
-    if task != "tracking":
-        raise ValueError("task must be point or tracking")
 
     # 为了与 rtmpc_demo 的 tracking 任务保持一致，这里直接复用其圆形参考轨迹生成逻辑。
     total_len = total_steps + N + 1
-    if tracking_profile not in ("paper_baseline", "high_speed_extension"):
-        raise ValueError("tracking_profile must be paper_baseline or high_speed_extension")
+    if tracking_profile != FIXED_TRACKING_PROFILE:
+        raise ValueError(
+            f"本脚本已固定 tracking_profile={FIXED_TRACKING_PROFILE}，收到 {tracking_profile}"
+        )
     if circle_radius <= 0.0:
         raise ValueError("circle_radius must be positive")
     if circle_period_steps <= 0:
         raise ValueError("circle_period_steps must be positive")
     period_steps = int(circle_period_steps)
-    if n == 4:
-        return build_circle_reference(
-            x0=x0,
-            total_len=total_len,
-            dt=float(sim_dt),
-            radius=float(circle_radius),
-            period_steps=period_steps,
-        )
 
     # 8维线性 iris 模型（PX4/NED）：x=[pn,pe,vn,ve,pd,vd,phi,theta]
     # 参考轨迹在 n-e 平面画圆，d(Down) 保持常值，倾角参考置零。
@@ -320,14 +303,7 @@ def make_reference(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Algorithm 1-style DAgger/BC loop with tube-guided augmentation")
-    parser.add_argument("--task", choices=["point", "tracking"], default="tracking")
-    parser.add_argument(
-        "--dynamics",
-        choices=["double_integrator", "iris_linear"],
-        default="iris_linear",
-        help="Dynamics model used by linear RTMPC expert and rollout simulation.",
-    )
+    parser = argparse.ArgumentParser(description="DAgger (fixed workflow: iris_linear + circle tracking)")
     parser.add_argument(
         "--disturbance-mode",
         choices=["state_box", "force_only"],
@@ -338,12 +314,6 @@ def main() -> None:
     parser.add_argument("--force_d_axis_scale", type=float, default=0.15, help="force_only 模式下 d 轴扰动限幅比例（0~1）")
     parser.add_argument("--cycles", type=int, default=8, help="Number of Algorithm 1 iterations")
     parser.add_argument("--sim-steps", type=int, default=120, help="Receding-horizon steps per cycle")
-    parser.add_argument(
-        "--tracking-profile",
-        choices=["paper_baseline", "high_speed_extension"],
-        default="high_speed_extension",
-        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
-    )
     parser.add_argument("--circle-radius", type=float, default=4.0, help="tracking 圆轨迹半径（m）")
     parser.add_argument("--circle-period-steps", type=int, default=126, help="tracking 圆轨迹一圈步数（dt=0.1s）")
     parser.add_argument("--horizon", type=int, default=30, help="MPC prediction horizon N")
@@ -401,33 +371,27 @@ def main() -> None:
     print(f"[log] started at: {datetime.now().isoformat(timespec='seconds')}")
     print(f"[log] command: {' '.join(sys.argv)}")
 
-    if args.dynamics == "double_integrator":
-        sim = DoubleIntegrator(dt=0.1)
-    else:
-        sim = LinearIrisHover(dt=0.1, mass=1.5)
+    sim = LinearIrisHover(dt=0.1, mass=1.5)
 
     A, B = sim.A, sim.B
     n, m = A.shape[0], B.shape[1]
-    x_min_base, x_max_base = base_state_bounds(args.dynamics)
-    if args.dynamics == "double_integrator":
-        u_min_base, u_max_base = base_input_bounds(args.dynamics, m=m)
-    else:
-        u_min_base, u_max_base = base_input_bounds(args.dynamics, mass=float(sim.mass))
-    x0 = base_initial_state(args.dynamics)
+    x_min_base, x_max_base = base_state_bounds(FIXED_DYNAMICS)
+    u_min_base, u_max_base = base_input_bounds(FIXED_DYNAMICS, mass=float(sim.mass))
+    x0 = base_initial_state(FIXED_DYNAMICS)
 
-    Qx = state_cost_matrix(args.dynamics)
-    Ru = input_cost_matrix(args.dynamics, m)
+    Qx = state_cost_matrix(FIXED_DYNAMICS)
+    Ru = input_cost_matrix(FIXED_DYNAMICS, m)
 
     Px, K = compute_infinite_lqr(A, B, Qx, Ru)
 
     w_half = disturbance_half_bounds(
-        args.dynamics,
+        FIXED_DYNAMICS,
         dt=float(sim.dt),
         mode=args.disturbance_mode,
         force_bound_mg=float(args.force_bound_mg),
         force_d_axis_scale=float(args.force_d_axis_scale),
     )
-    gp_x_min, gp_x_max = gp_query_state_bounds(args.dynamics)
+    gp_x_min, gp_x_max = gp_query_state_bounds(FIXED_DYNAMICS)
     gp_model = None
     gp_unc_half = np.zeros_like(w_half)
     gp_comp_half = np.zeros_like(w_half)
@@ -436,9 +400,9 @@ def main() -> None:
         if not gp_path.exists():
             raise FileNotFoundError(f"GP model not found: {gp_path}")
         gp_model = VelocityResidualGP.load(str(gp_path))
-        if gp_model.dynamics != args.dynamics:
+        if gp_model.dynamics != FIXED_DYNAMICS:
             raise ValueError(
-                f"GP dynamics mismatch: model={gp_model.dynamics}, current={args.dynamics}"
+                f"GP dynamics mismatch: model={gp_model.dynamics}, current={FIXED_DYNAMICS}"
             )
         if abs(float(gp_model.dt) - float(sim.dt)) > 1e-9:
             raise ValueError(
@@ -488,25 +452,20 @@ def main() -> None:
     cycles = int(args.cycles)
 
     x_ref_all = make_reference(
-        args.task,
         x0=x0,
         N=N,
         sim_dt=sim.dt,
         total_steps=sim_steps,
-        tracking_profile=args.tracking_profile,
+        tracking_profile=FIXED_TRACKING_PROFILE,
         circle_radius=float(args.circle_radius),
         circle_period_steps=int(args.circle_period_steps),
     )
 
     # 与 rtmpc_demo 的 circle tracking 行为一致：将初始状态对齐到参考的第一个点。
-    if args.task == "tracking":
-        x0 = x_ref_all[0].copy()
+    x0 = x_ref_all[0].copy()
 
-    # 论文：tracking 策略输入包含 (x_t, X^des_t)；point 策略输入包含 (x_t, x^des_{0|t}, t)
-    if args.task == "tracking":
-        policy_in_dim = n + (N + 1) * n
-    else:
-        policy_in_dim = 2 * n + 1
+    # 固定 tracking 策略输入： (x_t, X^des_t)
+    policy_in_dim = n + (N + 1) * n
 
     hidden = tuple(int(h) for h in args.hidden)
     model = build_mlp(policy_in_dim, m, hidden).to(args.device)
@@ -583,7 +542,7 @@ def main() -> None:
             u_rtmpc = ubar_star + K @ (x - xbar_star)
 
             # 论文 Algorithm 1 第 7 行：把实际访问状态 (x_t, X^des_t) 的 teacher 动作加入数据集
-            inp_t = make_policy_input(args.task, x=x, x_des_window=x_des, t=t)
+            inp_t = make_policy_input(x=x, x_des_window=x_des, t=t)
             aug_xs_cycle.append(inp_t.reshape(1, -1))
             aug_us_cycle.append(u_rtmpc.reshape(1, -1))
 
@@ -595,7 +554,7 @@ def main() -> None:
 
             # 为每个采样点拼接同一个 X^des_t（与论文 Line 10 一致）
             for j in range(xs_plus.shape[0]):
-                inp_plus = make_policy_input(args.task, x=xs_plus[j], x_des_window=x_des, t=t)
+                inp_plus = make_policy_input(x=xs_plus[j], x_des_window=x_des, t=t)
                 aug_xs_cycle.append(inp_plus.reshape(1, -1))
                 aug_us_cycle.append(us_plus[:, j].reshape(1, -1))
 
@@ -652,11 +611,11 @@ def main() -> None:
                 "hidden": hidden,
                 "input_dim": policy_in_dim,
                 "output_dim": m,
-                "task": args.task,
-                "dynamics": args.dynamics,
+                "task": FIXED_TASK,
+                "dynamics": FIXED_DYNAMICS,
                 "horizon": int(args.horizon),
                 "sim_steps": int(args.sim_steps),
-                "tracking_profile": args.tracking_profile,
+                "tracking_profile": FIXED_TRACKING_PROFILE,
                 "circle_radius": float(args.circle_radius),
                 "circle_period_steps": int(args.circle_period_steps),
                 "cycle": cycle_idx + 1,

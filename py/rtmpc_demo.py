@@ -3,7 +3,7 @@
 单文件演示：线性 RTMPC 的关键组成放在一个程序中，便于阅读与调试。
 
 包含部分：
-- 简单线性模型（DoubleIntegrator）
+- 简化 iris 线性模型（NED）
 - 无限时域 LQR（DARE）求解：计算终端代价 Px 与稳态反馈 K
 - 基于 OSQP 的有限时域带约束 QP 求解器（严格贴近论文 Eq.(10)）
 - 将 QP 结果与辅助控制器结合（Eq.(11)），并在仿真中演示闭环行为
@@ -273,33 +273,6 @@ def augment_at_center(
     delta = (pts - x_center.reshape(1, n)).T  # (n, Ns)
     u_pts = u_center.reshape(m, 1) + K @ delta
     return pts, u_pts.T
-
-"""离散时间双积分模型（演示用）。
-
-状态: x = [px, py, vx, vy]
-控制: u = [ax, ay]
-动力学: x_{t+1} = A x_t + B u_t
-"""
-class DoubleIntegrator:
-    def __init__(self, dt: float = 0.1):
-        self.dt = float(dt)
-        dt2 = 0.5 * self.dt * self.dt
-        self.A = np.array([
-            [1.0, 0.0, self.dt, 0.0],
-            [0.0, 1.0, 0.0, self.dt],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ], dtype=float)
-        self.B = np.array([
-            [dt2, 0.0],
-            [0.0, dt2],
-            [self.dt, 0.0],
-            [0.0, self.dt],
-        ], dtype=float)
-
-    def step(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        return self.A @ x + self.B @ u
-
 
 class LinearIrisHover:
     """PX4 iris 的简化悬停线性模型（离散时间，NED 坐标）。
@@ -641,39 +614,25 @@ def solve_rtmc_qp_with_gp_stagewise(
 
 
 def demo(
-    task: str = "tracking",
-    dynamics: str = "iris_linear",
     disturbance_mode: str = "force_only",
-    force_bound_mg: float = 0.5,
+    force_bound_mg: float = 0.15,
     force_d_axis_scale: float = 0.15,
     gp_model_path: Optional[str] = None,
-    gp_beta_sigma: float = 2.0,
+    gp_beta_sigma: float = 1.0,
     gp_shrink_mode: str = "residual",
-    tracking_shape: str = "line",
-    tracking_profile: str = "paper_baseline",
-    sim_steps: int = 60,
+    sim_steps: int = 120,
     circle_radius: float = 4.0,
     circle_period_steps: int = 126,
     plot_path: Optional[str] = None,
     augment_mode: str = "dense",
     include_onpolicy_teacher: bool = True,
 ):
-    """运行一个端到端示例，展示 Eq.(10) 与 Eq.(11) 在代码中的映射与行为。
-
-        task:
-            - "point": 目标点调节
-            - "tracking": 轨迹跟踪
-
-        tracking_shape:
-            - "line": 位置从起点匀速移动到目标点，然后保持
-            - "circle": 圆形参考轨迹（在 x-y 平面做匀速圆周运动）
-    """
-    if dynamics == "double_integrator":
-        sim = DoubleIntegrator(dt=0.1)
-    elif dynamics == "iris_linear":
-        sim = LinearIrisHover(dt=0.1, mass=1.5)
-    else:
-        raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
+    """运行固定工作流示例：iris_linear + tracking(circle)。"""
+    dynamics = "iris_linear"
+    task = "tracking"
+    tracking_shape = "circle"
+    tracking_profile = "high_speed_extension"
+    sim = LinearIrisHover(dt=0.1, mass=1.5)
 
     A, B = sim.A, sim.B
     n, m = A.shape[0], B.shape[1]
@@ -692,10 +651,7 @@ def demo(
 
     # 原始状态/控制约束盒（示例）
     x_min_base, x_max_base = base_state_bounds(dynamics)
-    if dynamics == "double_integrator":
-        u_min_base, u_max_base = base_input_bounds(dynamics, m=m)
-    else:
-        u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
+    u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
     x0 = base_initial_state(dynamics)
 
     # 干扰假设与鲁棒管 Z 计算
@@ -772,100 +728,35 @@ def demo(
         )
 
     N = 30
-    # 可选任务构造：目标点调节 vs 轨迹跟踪
-    if task == "point":
-        # 从当前状态 x0 跟踪到平衡点（iris 保持当前高度）
-        x_ref_all = np.zeros((N + 1, n))
-        if n == 8:
-            x_ref_all[:, 4] = float(x0[4])
-    elif task == "tracking":
-        if tracking_profile not in ("paper_baseline", "high_speed_extension"):
-            raise ValueError("tracking_profile 应为 'paper_baseline' 或 'high_speed_extension'")
-        total_len = int(sim_steps) + N + 1  # 需要可切片的参考长度（t..t+N）
-        if tracking_shape == "circle":
-            if circle_period_steps <= 0:
-                raise ValueError("circle_period_steps 必须为正")
-            if n == 4:
-                # 圆形匀速运动需要向心加速度 a = r * omega^2。
-                # 若收紧后的输入上限不足以提供该加速度，则跟踪会明显偏离（这是物理/约束不可行）。
-                omega = 2.0 * np.pi / (float(circle_period_steps) * float(sim.dt))
-                a_req = float(circle_radius) * omega * omega
-                u_cap = float(np.min(np.abs(u_max_t)))
-                if a_req > u_cap:
-                    print(
-                        "[warn] circle tracking may be infeasible under input bounds: "
-                        f"required centripetal accel ~ {a_req:.3f} > tightened u_max ~ {u_cap:.3f}. "
-                        "Try increasing --circle-period-steps (slower), decreasing --circle-radius, or relaxing u bounds."
-                    )
-                x_ref_all = build_circle_reference(
-                    x0=x0,
-                    total_len=total_len,
-                    dt=sim.dt,
-                    radius=float(circle_radius),
-                    period_steps=int(circle_period_steps),
-                )
-            else:
-                # iris 8维：在 n-e 平面给圆轨迹，pd 维度保持常值。
-                xy_ref = build_circle_reference(
-                    x0=x0[:4],
-                    total_len=total_len,
-                    dt=sim.dt,
-                    radius=float(circle_radius),
-                    period_steps=int(circle_period_steps),
-                    clockwise=True,
-                )
-                x_ref_all = np.zeros((total_len, n), dtype=float)
-                x_ref_all[:, 0] = xy_ref[:, 0]
-                x_ref_all[:, 1] = xy_ref[:, 1]
-                x_ref_all[:, 2] = xy_ref[:, 2]
-                x_ref_all[:, 3] = xy_ref[:, 3]
-                x_ref_all[:, 4] = float(x0[4])
-                x_ref_all = apply_tracking_profile_iris(
-                    x_ref_all,
-                    dt=float(sim.dt),
-                    tracking_profile=tracking_profile,
-                    g=float(sim.g),
-                    phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
-                    theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
-                )
+    total_len = int(sim_steps) + N + 1
+    if circle_period_steps <= 0:
+        raise ValueError("circle_period_steps 必须为正")
 
-            # 给定与轨迹相同的初始状态。
-            x0 = x_ref_all[0].copy()
-            print(f"[info] align initial state to circle reference: x0={x0}")
-            
-        elif tracking_shape == "line":
-            # 轨迹跟踪示例：位置从 p_start 匀速移动到 p_goal，速度参考与之匹配；到达后保持。
-            p_start = x0[:2].copy()
-            p_goal = np.array([0.0, 0.0])
-            T_move = max(1, int(sim_steps))  # 用 sim_steps 步完成移动
+    xy_ref = build_circle_reference(
+        x0=x0[:4],
+        total_len=total_len,
+        dt=sim.dt,
+        radius=float(circle_radius),
+        period_steps=int(circle_period_steps),
+        clockwise=True,
+    )
+    x_ref_all = np.zeros((total_len, n), dtype=float)
+    x_ref_all[:, 0] = xy_ref[:, 0]
+    x_ref_all[:, 1] = xy_ref[:, 1]
+    x_ref_all[:, 2] = xy_ref[:, 2]
+    x_ref_all[:, 3] = xy_ref[:, 3]
+    x_ref_all[:, 4] = float(x0[4])
+    x_ref_all = apply_tracking_profile_iris(
+        x_ref_all,
+        dt=float(sim.dt),
+        tracking_profile=tracking_profile,
+        g=float(sim.g),
+        phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
+        theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
+    )
 
-            alphas = np.linspace(0.0, 1.0, T_move + 1)
-            pos_move = (1.0 - alphas)[:, None] * p_start[None, :] + alphas[:, None] * p_goal[None, :]
-            pos_ref = np.vstack([pos_move, np.tile(p_goal[None, :], (total_len - (T_move + 1), 1))])
-            v_const = (p_goal - p_start) / (T_move * sim.dt)
-            vel_ref = np.vstack([
-                np.tile(v_const[None, :], (T_move + 1, 1)),
-                np.zeros((total_len - (T_move + 1), 2)),
-            ])
-            if n == 4:
-                x_ref_all = np.hstack([pos_ref, vel_ref])
-            else:
-                x_ref_all = np.zeros((total_len, n), dtype=float)
-                x_ref_all[:, 0:2] = pos_ref
-                x_ref_all[:, 2:4] = vel_ref
-                x_ref_all[:, 4] = float(x0[4])
-                x_ref_all = apply_tracking_profile_iris(
-                    x_ref_all,
-                    dt=float(sim.dt),
-                    tracking_profile=tracking_profile,
-                    g=float(sim.g),
-                    phi_bounds=(float(x_min_base[6]), float(x_max_base[6])),
-                    theta_bounds=(float(x_min_base[7]), float(x_max_base[7])),
-                )
-        else:
-            raise ValueError("tracking_shape 应为 'line' 或 'circle'")
-    else:
-        raise ValueError("task 应为 'point' 或 'tracking'")
+    x0 = x_ref_all[0].copy()
+    print(f"[info] align initial state to circle reference: x0={x0}")
 
     # Receding-horizon RTMPC（对齐论文 Eq.(10)-(11)）：
     # - x: 实际系统（含扰动）
@@ -1038,9 +929,9 @@ def demo(
 if __name__ == "__main__":
     _maybe_reexec_into_workspace_venv()
 
-    parser = argparse.ArgumentParser(description="Robust Tube MPC demo")
-    parser.add_argument("--task", choices=["point", "tracking"], default="tracking")
-    parser.add_argument("--dynamics", choices=["double_integrator", "iris_linear"], default="iris_linear")
+    parser = argparse.ArgumentParser(
+        description="Robust Tube MPC demo (fixed workflow: iris_linear + circle tracking)"
+    )
     parser.add_argument(
         "--disturbance-mode",
         choices=["state_box", "force_only"],
@@ -1056,13 +947,6 @@ if __name__ == "__main__":
         choices=["none", "residual"],
         default="residual",
         help="GP收缩模式：none=不收缩；residual=base-gp_comp+gp_unc 的残差边界。",
-    )
-    parser.add_argument("--tracking-shape", choices=["line", "circle"], default="circle")
-    parser.add_argument(
-        "--tracking-profile",
-        choices=["paper_baseline", "high_speed_extension"],
-        default="high_speed_extension",
-        help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
     parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--circle-radius", type=float, default=4.0)
@@ -1089,16 +973,12 @@ if __name__ == "__main__":
         args.plot = str(workspace_root / "circle_tracking_aug.png")
 
     demo(
-        task=args.task,
-        dynamics=args.dynamics,
         disturbance_mode=args.disturbance_mode,
         force_bound_mg=args.force_bound_mg,
         force_d_axis_scale=args.force_d_axis_scale,
         gp_model_path=args.gp_model,
         gp_beta_sigma=float(args.gp_beta_sigma),
         gp_shrink_mode=args.gp_shrink_mode,
-        tracking_shape=args.tracking_shape,
-        tracking_profile=args.tracking_profile,
         sim_steps=args.sim_steps,
         circle_radius=args.circle_radius,
         circle_period_steps=args.circle_period_steps,
