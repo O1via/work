@@ -40,7 +40,7 @@ from rtmpc_demo import (
     LinearIrisHover,
     compute_infinite_lqr,
     compute_rpi_box,
-    solve_rtmc_qp_paper,
+    solve_rtmc_qp_with_gp_stagewise,
     tighten_box_bounds_with_auto_scale,
 )
 from rtmpc_constants import (
@@ -48,6 +48,7 @@ from rtmpc_constants import (
     base_input_bounds,
     base_state_bounds,
     disturbance_half_bounds,
+    gp_query_state_bounds,
     input_cost_matrix,
     sample_process_disturbance,
     state_cost_matrix,
@@ -108,6 +109,7 @@ def build_validation_context(
         force_bound_mg=float(force_bound_mg),
         force_d_axis_scale=float(force_d_axis_scale),
     )
+    gp_x_min, gp_x_max = gp_query_state_bounds(dynamics)
     gp_model = None
     gp_unc_half = np.zeros_like(w_half_target)
     gp_comp_half = np.zeros_like(w_half_target)
@@ -136,15 +138,17 @@ def build_validation_context(
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
         gp_unc_half = gp_model.conservative_uncertainty_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
             beta_sigma=float(gp_beta_sigma),
         )
         gp_comp_half = gp_model.conservative_mean_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
         )
         print(f"[gp] loaded model: {gp_path}")
+        print(f"[gp] query bounds x_min={gp_x_min}")
+        print(f"[gp] query bounds x_max={gp_x_max}")
         print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_unc_half}")
         print(f"[gp] compensable mean bound: {gp_comp_half}")
 
@@ -167,6 +171,8 @@ def build_validation_context(
     u_min_t, u_max_t, gamma_u = tighten_box_bounds_with_auto_scale(
         u_min_base, u_max_base, u_half, name="input"
     )
+    if gamma_x < 1.0 or gamma_u < 1.0:
+        print(f"[info] tighten scale factors: gamma_x={gamma_x:.4f}, gamma_u={gamma_u:.4f}")
 
     x_ref_all = make_reference(
         task,
@@ -289,19 +295,13 @@ def rollout_expert(
     xs = [x.copy()]
     us = []
     refs = []
+    xbars = []
     state_violations = 0
 
     for t in range(sim_steps):
         x_des = ctx["x_ref_all"][t : t + horizon + 1]
-        d_affine = None
         gp_model = ctx.get("gp_model", None)
-        if gp_model is not None:
-            d_mean, _ = gp_model.predict_state_disturbance(
-                x=x,
-                beta_sigma=float(ctx["gp_beta_sigma"][0]),
-            )
-            d_affine = np.tile(d_mean.reshape(1, -1), (horizon, 1))
-        Xbar, Ubar = solve_rtmc_qp_paper(
+        Xbar, Ubar, _, _ = solve_rtmc_qp_with_gp_stagewise(
             A=ctx["A"],
             B=ctx["B"],
             Qx=ctx["Qx"],
@@ -313,10 +313,13 @@ def rollout_expert(
             z_half=ctx["z_half"],
             x_bounds=(ctx["x_min_t"], ctx["x_max_t"]),
             u_bounds=(ctx["u_min_t"], ctx["u_max_t"]),
-            d_affine=d_affine,
+            gp_model=gp_model,
+            gp_beta_sigma=float(ctx["gp_beta_sigma"][0]),
+            stagewise_refine_steps=1,
         )
         xbar_star = Xbar[0]
         ubar_star = Ubar[0]
+        xbars.append(xbar_star.copy())
         u = ubar_star + ctx["K"] @ (x - xbar_star)
         u = np.clip(u, ctx["u_min_base"], ctx["u_max_base"])
 
@@ -332,10 +335,12 @@ def rollout_expert(
     xs_arr = np.asarray(xs)
     us_arr = np.asarray(us)
     refs_arr = np.asarray(refs)
+    xbars_arr = np.asarray(xbars)
     return {
         "xs": xs_arr,
         "us": us_arr,
         "refs": refs_arr,
+        "xbars": xbars_arr,
         "state_violations": np.asarray([state_violations], dtype=int),
     }
 
@@ -381,6 +386,7 @@ def maybe_plot_domain(
     domain: str,
     policy_rollout: Dict[str, np.ndarray],
     expert_rollout: Optional[Dict[str, np.ndarray]],
+    z_half: Optional[np.ndarray] = None,
     interactive_trajectory: bool = False,
 ) -> Optional[object]:
     if interactive_trajectory:
@@ -415,26 +421,134 @@ def maybe_plot_domain(
     xs_policy = policy_rollout["xs"]
     interactive_fig = None
 
+    def _draw_box_wire(
+        ax,
+        cx: float,
+        cy: float,
+        cz: float,
+        hx: float,
+        hy: float,
+        hz: float,
+        color: str = "tab:blue",
+        alpha: float = 0.25,
+        linewidth: float = 0.8,
+    ) -> None:
+        corners = np.array(
+            [
+                [cx - hx, cy - hy, cz - hz],
+                [cx + hx, cy - hy, cz - hz],
+                [cx + hx, cy + hy, cz - hz],
+                [cx - hx, cy + hy, cz - hz],
+                [cx - hx, cy - hy, cz + hz],
+                [cx + hx, cy - hy, cz + hz],
+                [cx + hx, cy + hy, cz + hz],
+                [cx - hx, cy + hy, cz + hz],
+            ],
+            dtype=float,
+        )
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        for i, j in edges:
+            ax.plot(
+                [corners[i, 0], corners[j, 0]],
+                [corners[i, 1], corners[j, 1]],
+                [corners[i, 2], corners[j, 2]],
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
+            )
+
     # 轨迹图：double_integrator 用 2D；iris(8维) 默认输出 3D 位置轨迹。
     if refs.shape[1] >= 5:
         fig = plt.figure(figsize=(7, 6))
         ax = fig.add_subplot(111, projection="3d")
-        # NED -> 绘图用高度 Up=-pd
-        ref_x, ref_y, ref_z = refs[:, 0], refs[:, 1], -refs[:, 4]
-        pol_x, pol_y, pol_z = xs_policy[:, 0], xs_policy[:, 1], -xs_policy[:, 4]
+        # NED -> 绘图采用 x=E(pe), y=N(pn), z=Up=-pd
+        ref_x, ref_y, ref_z = refs[:, 1], refs[:, 0], -refs[:, 4]
+        pol_x, pol_y, pol_z = xs_policy[:, 1], xs_policy[:, 0], -xs_policy[:, 4]
         ax.plot(ref_x, ref_y, ref_z, "k--", linewidth=1.2, label="reference")
         ax.plot(pol_x, pol_y, pol_z, "r-", linewidth=2.0, label="policy")
         if expert_rollout is not None:
             xs_expert = expert_rollout["xs"]
-            ax.plot(xs_expert[:, 0], xs_expert[:, 1], -xs_expert[:, 4], "b-", linewidth=1.6, label="expert")
+            ax.plot(xs_expert[:, 1], xs_expert[:, 0], -xs_expert[:, 4], "b-", linewidth=1.6, label="expert")
+
+        if z_half is not None and refs.shape[1] >= 5:
+            z = np.asarray(z_half, dtype=float).reshape(-1)
+            if z.size >= 5:
+                # NED -> plot axes: x=e(pe), y=n(pn), z=up(-pd)
+                hx = float(max(0.0, z[1]))  # e
+                hy = float(max(0.0, z[0]))  # n
+                hz = float(max(0.0, z[4]))  # up half-width equals pd half-width
+                if hx > 0.0 or hy > 0.0 or hz > 0.0:
+                    center_src = None
+                    if expert_rollout is not None and "xbars" in expert_rollout:
+                        center_src = np.asarray(expert_rollout["xbars"], dtype=float)
+                    if center_src is None or center_src.ndim != 2 or center_src.shape[1] < 5:
+                        center_src = np.asarray(refs, dtype=float)
+
+                    # 管中心（绘图坐标）：x=e, y=n, z=up
+                    c_plot = np.stack(
+                        [center_src[:, 1], center_src[:, 0], -center_src[:, 4]],
+                        axis=1,
+                    )  # (T, 3)
+                    half_vec = np.array([hx, hy, hz], dtype=float)
+
+                    # 8 个角点轨迹：给出连续“包络线”
+                    signs = np.array(
+                        [
+                            [-1.0, -1.0, -1.0],
+                            [ 1.0, -1.0, -1.0],
+                            [-1.0,  1.0, -1.0],
+                            [ 1.0,  1.0, -1.0],
+                            [-1.0, -1.0,  1.0],
+                            [ 1.0, -1.0,  1.0],
+                            [-1.0,  1.0,  1.0],
+                            [ 1.0,  1.0,  1.0],
+                        ],
+                        dtype=float,
+                    )
+                    corners = c_plot[None, :, :] + signs[:, None, :] * half_vec[None, None, :]  # (8, T, 3)
+
+                    # 沿时间方向的 8 条连续包络线（主要可视化）
+                    for ci in range(8):
+                        ax.plot(
+                            corners[ci, :, 0],
+                            corners[ci, :, 1],
+                            corners[ci, :, 2],
+                            color="tab:cyan",
+                            alpha=0.70,
+                            linewidth=1.0,
+                        )
+
+                    # 补充截面框，增强“管”视觉（不过密，避免遮挡）
+                    edges = [
+                        (0, 1), (1, 3), (3, 2), (2, 0),
+                        (4, 5), (5, 7), (7, 6), (6, 4),
+                        (0, 4), (1, 5), (2, 6), (3, 7),
+                    ]
+                    n_pts = int(c_plot.shape[0])
+                    stride = max(1, n_pts // 20)
+                    for k in range(0, n_pts, stride):
+                        ck = corners[:, k, :]  # (8,3)
+                        for i, j in edges:
+                            ax.plot(
+                                [ck[i, 0], ck[j, 0]],
+                                [ck[i, 1], ck[j, 1]],
+                                [ck[i, 2], ck[j, 2]],
+                                color="tab:cyan",
+                                alpha=0.25,
+                                linewidth=0.8,
+                            )
 
         # 统一三轴量纲：让 n/e/up 的坐标范围在同一数量级，避免 z 轴过窄导致“高度偏差被视觉放大”。
         all_x = [ref_x, pol_x]
         all_y = [ref_y, pol_y]
         all_z = [ref_z, pol_z]
         if expert_rollout is not None:
-            all_x.append(xs_expert[:, 0])
-            all_y.append(xs_expert[:, 1])
+            all_x.append(xs_expert[:, 1])
+            all_y.append(xs_expert[:, 0])
             all_z.append(-xs_expert[:, 4])
 
         x_cat = np.concatenate(all_x)
@@ -456,8 +570,8 @@ def maybe_plot_domain(
         ax.set_zlim(z_mid - half, z_mid + half)
         ax.set_box_aspect((1.0, 1.0, 1.0))
 
-        ax.set_xlabel("n")
-        ax.set_ylabel("e")
+        ax.set_xlabel("e")
+        ax.set_ylabel("n")
         ax.set_zlabel("up")
         ax.set_title(f"Validation trajectory 3D ({domain})")
         ax.legend(frameon=False)
@@ -640,7 +754,7 @@ def main() -> None:
         "--init-pos3d",
         type=float,
         nargs=3,
-        default=[4.0, 0.0, -0.8],
+        default=[-4.0, 0.0, -0.8],
         metavar=("PN", "PE", "PD"),
         help="仅覆盖 rollout 初始三维位置 [pn, pe, pd]；不会修改参考轨迹。",
     )
@@ -927,6 +1041,7 @@ def main() -> None:
                 domain,
                 first_policy_rollout,
                 first_expert_rollout,
+                z_half=ctx["z_half"],
                 interactive_trajectory=args.interactive_trajectory,
             )
             if maybe_fig is not None:

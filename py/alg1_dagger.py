@@ -106,7 +106,7 @@ from rtmpc_demo import (
     compute_infinite_lqr,
     compute_rpi_box,
     sample_box_points,
-    solve_rtmc_qp_paper,
+    solve_rtmc_qp_with_gp_stagewise,
     tighten_box_bounds_with_auto_scale,
 )
 from gp_residual_model import VelocityResidualGP, residual_shrink_bounds
@@ -115,6 +115,7 @@ from rtmpc_constants import (
     base_input_bounds,
     base_state_bounds,
     disturbance_half_bounds,
+    gp_query_state_bounds,
     input_cost_matrix,
     state_cost_matrix,
 )
@@ -296,6 +297,7 @@ def make_reference(
             dt=float(sim_dt),
             radius=float(circle_radius),
             period_steps=period_steps,
+            clockwise=True,
         )
         out = np.zeros((total_len, n), dtype=float)
         out[:, 0] = xy_ref[:, 0]  # pn
@@ -425,6 +427,7 @@ def main() -> None:
         force_bound_mg=float(args.force_bound_mg),
         force_d_axis_scale=float(args.force_d_axis_scale),
     )
+    gp_x_min, gp_x_max = gp_query_state_bounds(args.dynamics)
     gp_model = None
     gp_unc_half = np.zeros_like(w_half)
     gp_comp_half = np.zeros_like(w_half)
@@ -446,15 +449,17 @@ def main() -> None:
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
         gp_unc_half = gp_model.conservative_uncertainty_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
             beta_sigma=float(args.gp_beta_sigma),
         )
         gp_comp_half = gp_model.conservative_mean_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
         )
         print(f"[gp] loaded model: {gp_path}")
+        print(f"[gp] query bounds x_min={gp_x_min}")
+        print(f"[gp] query bounds x_max={gp_x_max}")
         print(f"[gp] uncertainty bound (beta={args.gp_beta_sigma:.2f}): {gp_unc_half}")
         print(f"[gp] compensable mean bound: {gp_comp_half}")
 
@@ -552,16 +557,10 @@ def main() -> None:
 
         for t in range(sim_steps):
             x_des = x_ref_all[t : t + N + 1]
-            d_affine = None
-            if gp_model is not None:
-                d_mean, _ = gp_model.predict_state_disturbance(
-                    x=x,
-                    beta_sigma=float(args.gp_beta_sigma),
-                )
-                d_affine = np.tile(d_mean.reshape(1, -1), (N, 1))
-
-            # 论文 Eq.(10)：包含 tube 初值约束 x_t ∈ x̄_{0|t} ⊕ Z（这里用盒 Z 的外包框 z_half）
-            Xbar, Ubar = solve_rtmc_qp_paper(
+            # 与 monte/demo 保持一致：使用 stagewise GP 均值补偿专家。
+            # - 无 GP 时退化为普通 solve_rtmc_qp_paper；
+            # - 有 GP 时先无补偿求解，再按预测轨迹逐点更新 d_affine 重解。
+            Xbar, Ubar, _, _ = solve_rtmc_qp_with_gp_stagewise(
                 A=A,
                 B=B,
                 Qx=Qx,
@@ -573,7 +572,9 @@ def main() -> None:
                 z_half=z_half,
                 x_bounds=(x_min_t, x_max_t),
                 u_bounds=(u_min_t, u_max_t),
-                d_affine=d_affine,
+                gp_model=gp_model,
+                gp_beta_sigma=float(args.gp_beta_sigma),
+                stagewise_refine_steps=1,
             )
 
             # 论文 Eq.(11)：u_t^{RTMPC} = ū*_t + K(x_t - x̄*_t)

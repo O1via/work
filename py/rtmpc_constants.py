@@ -114,33 +114,31 @@ def sample_force_mapped_acceleration(
     force_bound_mg: float,
     force_d_axis_scale: float = 0.15,
 ) -> np.ndarray:
-    """按论文常见设置采样外力映射加速度（NED 三轴）。
+    """采样与 `force_bound_to_state_w_half` 一致的加速度扰动（NED 三轴）。
 
-    采样方式：
-    - 加速度幅值 a_mag ~ U(0, a_max), a_max = c*g
-    - theta ~ U(0, pi), phi ~ U(0, 2pi)
-    - a = a_mag * [cos(phi)sin(theta), sin(phi)sin(theta), cos(theta)]
+    这里采用“方案A：设计集合=注入集合”：
+    - 设计侧（约束收紧）用的是球内接盒：a_axis = c*g/sqrt(3)
+    - 注入侧也直接在同一盒内逐轴均匀采样
+
+    这样可保证 `force_only` 模式下，注入扰动始终落在用于计算 z_half 的
+    扰动盒内，避免“注入比设计更大”导致的鲁棒性失配。
     """
     if force_bound_mg < 0.0:
         raise ValueError("force_bound_mg 必须 >= 0")
     if force_d_axis_scale < 0.0:
         raise ValueError("force_d_axis_scale 必须 >= 0")
     amax = float(force_bound_mg) * 9.80665
-    a_mag = rng.uniform(0.0, amax)
-    theta = rng.uniform(0.0, np.pi)
-    phi = rng.uniform(0.0, 2.0 * np.pi)
-    a = np.array(
+    a_axis = amax / np.sqrt(3.0)
+    d_scale = float(min(force_d_axis_scale, 1.0))
+    a_axis_d = a_axis * d_scale
+    return np.array(
         [
-            a_mag * np.cos(phi) * np.sin(theta),
-            a_mag * np.sin(phi) * np.sin(theta),
-            a_mag * np.cos(theta),
+            rng.uniform(-a_axis, a_axis),
+            rng.uniform(-a_axis, a_axis),
+            rng.uniform(-a_axis_d, a_axis_d),
         ],
         dtype=float,
     )
-    # 额外限制 d 轴扰动幅值，保持总加速度范数不超过 amax。
-    d_cap = float(min(force_d_axis_scale, 1.0)) * amax
-    a[2] = float(np.clip(a[2], -d_cap, d_cap))
-    return a
 
 
 def accel_to_state_disturbance(
@@ -227,6 +225,24 @@ def base_state_bounds(dynamics: str) -> Tuple[np.ndarray, np.ndarray]:
     if dynamics == "iris_linear":
         # x=[pn,pe,vn,ve,pd,vd,phi,theta] (NED)
         return (
+            np.array([-8.0, -8.0, -2.5, -2.5, -5.0, -1.0, -1.0, -1.0], dtype=float),
+            np.array([8.0, 8.0, 2.5, 2.5, -0.2, 1.0, 1.0, 1.0], dtype=float),
+        )
+    raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")
+
+
+def gp_query_state_bounds(dynamics: str) -> Tuple[np.ndarray, np.ndarray]:
+    """返回 GP 管宽保守估计使用的查询状态域 (x_min_gp, x_max_gp)。
+
+    该边界与 `base_state_bounds`（MPC 硬约束）解耦，便于分别调整：
+    - MPC 约束用于 QP 可行域；
+    - GP 查询域用于 conservative_mean/uncertainty 的保守扫描范围。
+    """
+    if dynamics == "double_integrator":
+        return base_state_bounds(dynamics)
+    if dynamics == "iris_linear":
+        # x=[pn,pe,vn,ve,pd,vd,phi,theta] (NED)
+        return (
             np.array([-8.0, -8.0, -2.2, -2.2, -5.0, -0.6, -1.0, -1.0], dtype=float),
             np.array([8.0, 8.0, 2.2, 2.2, -0.2, 0.6, 1.0, 1.0], dtype=float),
         )
@@ -256,5 +272,5 @@ def base_initial_state(dynamics: str) -> np.ndarray:
         return np.array([1.0, 0.5, 0.0, 0.0], dtype=float)
     if dynamics == "iris_linear":
         # 默认初始高度约 1m（NED: pd=-1）
-        return np.array([4.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=float)
+        return np.array([0.0, 4.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0], dtype=float)
     raise ValueError("dynamics 应为 'double_integrator' 或 'iris_linear'")

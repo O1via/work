@@ -26,6 +26,7 @@ from rtmpc_constants import (
     base_input_bounds,
     base_state_bounds,
     disturbance_half_bounds,
+    gp_query_state_bounds,
     input_cost_matrix,
     sample_process_disturbance,
     state_cost_matrix,
@@ -91,6 +92,7 @@ def build_context(
     else:
         u_min_base, u_max_base = base_input_bounds(dynamics, mass=float(sim.mass))
 
+    gp_x_min, gp_x_max = gp_query_state_bounds(dynamics)
     gp_model = None
     gp_unc_half = np.zeros_like(w_half)
     gp_comp_half = np.zeros_like(w_half)
@@ -112,15 +114,17 @@ def build_context(
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
         gp_unc_half = gp_model.conservative_uncertainty_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
             beta_sigma=float(gp_beta_sigma),
         )
         gp_comp_half = gp_model.conservative_mean_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
         )
         print(f"[gp] loaded model: {gp_path}")
+        print(f"[gp] query bounds x_min={gp_x_min}")
+        print(f"[gp] query bounds x_max={gp_x_max}")
         print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_unc_half}")
         print(f"[gp] compensable mean bound: {gp_comp_half}")
 
@@ -449,21 +453,29 @@ def plot_center_tracking(result: Dict[str, np.ndarray], out_path: Path, max_epis
         print("[warn] skip center plot: center/ref history not available")
         return
 
+    if center.shape[-1] >= 8:
+        # NED 可视化采用 x=E(pe), y=N(pn)
+        ix, iy = 1, 0
+        x_label, y_label = "e", "n"
+    else:
+        ix, iy = 0, 1
+        x_label, y_label = "x", "y"
+
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(111)
-    ax.plot(ref[0, :, 0], ref[0, :, 1], "k--", linewidth=1.5, label="reference")
+    ax.plot(ref[0, :, ix], ref[0, :, iy], "k--", linewidth=1.5, label="reference")
     ep_show = min(int(center.shape[0]), int(max_episode_lines))
     for ep in range(ep_show):
         ax.plot(
-            center[ep, :, 0],
-            center[ep, :, 1],
+            center[ep, :, ix],
+            center[ep, :, iy],
             linewidth=1.2,
             alpha=0.9 if ep == 0 else 0.45,
             label=f"tube center ep{ep}" if ep < 3 else None,
         )
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("n")
-    ax.set_ylabel("e")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.set_title("Monte: Tube Center vs Reference")
     ax.legend(loc="best", frameon=False)
     fig.tight_layout()

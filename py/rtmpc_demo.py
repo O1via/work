@@ -28,6 +28,7 @@ from rtmpc_constants import (
     base_input_bounds,
     base_state_bounds,
     disturbance_half_bounds,
+    gp_query_state_bounds,
     input_cost_matrix,
     state_cost_matrix,
 )
@@ -65,14 +66,17 @@ def build_circle_reference(
     dt: float,
     radius: float = 4.0,
     period_steps: int = 63,
+    clockwise: bool = False,
 ) -> np.ndarray:
     """生成圆形参考轨迹（在 x-y 平面做匀速圆周运动 ）。
 
     参考状态: [px, py, vx, vy]
-    - 圆心默认选择为使得 k=0 时位置等于 x0[:2]
+    - 圆心固定为原点 (0,0)，不随 x0 变化
     - 角速度按 period_steps 个离散步完成一圈
+    - clockwise=False: 在 (x,y) 平面逆时针
+    - clockwise=True: 在 (x,y) 平面顺时针
     """
-    x0 = np.asarray(x0)
+    _ = np.asarray(x0)  # 保留接口兼容；当前实现不再使用 x0 来平移圆心。
     if total_len < 2:
         raise ValueError("total_len 必须 >= 2")
     if period_steps <= 0:
@@ -80,16 +84,16 @@ def build_circle_reference(
     if radius <= 0.0:
         raise ValueError("radius 必须为正")
 
-    p0 = x0[:2].astype(float)
     theta0 = 0.0
-    center = p0 - radius * np.array([np.cos(theta0), np.sin(theta0)])
+    center = np.zeros((2,), dtype=float)
 
     k = np.arange(total_len, dtype=float)
     theta = theta0 + 2.0 * np.pi * k / float(period_steps)
-    pos = center.reshape(1, 2) + radius * np.stack([np.cos(theta), np.sin(theta)], axis=1)
+    s = -1.0 if clockwise else 1.0
+    pos = center.reshape(1, 2) + radius * np.stack([np.cos(theta), s * np.sin(theta)], axis=1)
 
     omega = 2.0 * np.pi / (float(period_steps) * float(dt))
-    vel = radius * omega * np.stack([-np.sin(theta), np.cos(theta)], axis=1)
+    vel = radius * omega * np.stack([-np.sin(theta), s * np.cos(theta)], axis=1)
 
     return np.hstack([pos, vel])
 
@@ -704,6 +708,7 @@ def demo(
         force_bound_mg=float(force_bound_mg),
         force_d_axis_scale=float(force_d_axis_scale),
     )
+    gp_x_min, gp_x_max = gp_query_state_bounds(dynamics)
     gp_model = None
     gp_unc_half = np.zeros_like(w_half)
     gp_comp_half = np.zeros_like(w_half)
@@ -725,15 +730,17 @@ def demo(
                 f"GP state_dim mismatch: model={gp_model.state_dim}, current={n}"
             )
         gp_unc_half = gp_model.conservative_uncertainty_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
             beta_sigma=float(gp_beta_sigma),
         )
         gp_comp_half = gp_model.conservative_mean_bound(
-            x_min=x_min_base,
-            x_max=x_max_base,
+            x_min=gp_x_min,
+            x_max=gp_x_max,
         )
         print(f"[gp] loaded model: {gp_path}")
+        print(f"[gp] query bounds x_min={gp_x_min}")
+        print(f"[gp] query bounds x_max={gp_x_max}")
         print(f"[gp] uncertainty bound (beta={gp_beta_sigma:.2f}): {gp_unc_half}")
         print(f"[gp] compensable mean bound: {gp_comp_half}")
 
@@ -805,6 +812,7 @@ def demo(
                     dt=sim.dt,
                     radius=float(circle_radius),
                     period_steps=int(circle_period_steps),
+                    clockwise=True,
                 )
                 x_ref_all = np.zeros((total_len, n), dtype=float)
                 x_ref_all[:, 0] = xy_ref[:, 0]
@@ -985,11 +993,19 @@ def demo(
             err_norm = np.linalg.norm(pos_err, axis=1)
             print(f"tube-center tracking position error: mean={err_norm.mean():.4f}, max={err_norm.max():.4f}")
 
+        if xs_bar_arr.shape[1] >= 8:
+            # NED 可视化采用 x=E(pe), y=N(pn)
+            ix, iy = 1, 0
+            x_label, y_label = "e", "n"
+        else:
+            ix, iy = 0, 1
+            x_label, y_label = "x", "y"
+
         fig = plt.figure(figsize=(6, 6))
         ax = fig.add_subplot(111)
         if ref_xy is not None:
-            ax.plot(ref_xy[:, 0], ref_xy[:, 1], "k--", linewidth=1.0, label="reference")
-        ax.plot(xs_bar_arr[:, 0], xs_bar_arr[:, 1], "b-", linewidth=2.0, label="tube center ($\\bar{x}$)")
+            ax.plot(ref_xy[:, ix], ref_xy[:, iy], "k--", linewidth=1.0, label="reference")
+        ax.plot(xs_bar_arr[:, ix], xs_bar_arr[:, iy], "b-", linewidth=2.0, label="tube center ($\\bar{x}$)")
 
         # # Tube 边界（包络线）可视化：显示 tube x̄ ⊕ Z 在 (x,y) 平面上的外/内边界。
         # # Z 这里用轴对齐盒外包框 half-width=z_half，因此在单位法向 n 上的支持函数为
@@ -1008,10 +1024,10 @@ def demo(
         # ax.plot(outer[:, 0], outer[:, 1], "b-", linewidth=1.0, alpha=0.25, label="tube boundary")
         # ax.plot(inner[:, 0], inner[:, 1], "b-", linewidth=1.0, alpha=0.25)
 
-        ax.scatter(aug_xs[:, 0], aug_xs[:, 1], s=6, alpha=0.12, c="tab:orange", label="augmented")
+        ax.scatter(aug_xs[:, ix], aug_xs[:, iy], s=6, alpha=0.12, c="tab:orange", label="augmented")
         ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
         ax.set_title(f"{task} / {tracking_shape}: nominal vs augmented")
         ax.legend(loc="best", frameon=False)
         fig.tight_layout()
@@ -1048,7 +1064,7 @@ if __name__ == "__main__":
         default="high_speed_extension",
         help="tracking 参考模式：paper_baseline=phi/theta参考为0；high_speed_extension=由速度差分反解姿态参考。",
     )
-    parser.add_argument("--sim-steps", type=int, default=150)
+    parser.add_argument("--sim-steps", type=int, default=120)
     parser.add_argument("--circle-radius", type=float, default=4.0)
     parser.add_argument("--circle-period-steps", type=int, default=126)
     parser.add_argument(
