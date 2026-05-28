@@ -10,3 +10,8 @@ py/**/*.pyc
 
 git add -A && git commit -m "chore: track only py directory"
 
+
+# Allow off_node submodule managed under work repo
+!.gitmodules
+!/external/
+!/external/off_node/
